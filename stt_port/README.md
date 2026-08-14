@@ -93,6 +93,14 @@ One WebSocket connection per call, opened by the phone machine.
 Binary in the here→phone direction is reserved for synthesized speech to play down the
 line. Nothing sends it yet; the phone side already knows how to write it to Asterisk.
 
+**`call_end` starts the teardown, it doesn't finish it.** Hangup is the only thing that
+flushes the utterance a caller was mid-way through, so that utterance is still queued for
+inference when `call_end` arrives — and inference takes a second or more, on another thread.
+The connection is therefore held open after `call_end` until the call's outstanding chunks
+have come back (`FINAL_DRAIN_TIMEOUT`, 5s ceiling), and **this side closes the socket**; the
+phone machine waits for that close. Unregistering the socket at `call_end` instead means the
+last thing the caller said is transcribed into nowhere.
+
 ### Why a WebSocket, and why this is smaller than what it replaced
 
 The previous design carried the same audio over UDP with a hand-written 16-byte header, and

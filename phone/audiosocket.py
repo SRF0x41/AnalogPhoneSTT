@@ -112,11 +112,16 @@ class Call:
         self.frames_out = 0
         self._ended = False
         self._pushback: bytes | Dtmf | None = None  # see ready()
+        # Stands in for the UUID if Asterisk never sends one. Random rather than a fixed
+        # placeholder because `label` identifies the call to the stt machine, which keys
+        # its per-call state on it -- two unidentified concurrent calls sharing one label
+        # would have their transcripts routed to whichever socket registered last.
+        self._fallback_label = uuid.uuid4().hex[:8]
 
     @property
     def label(self) -> str:
         """Short, stable tag for log lines. The first block of the UUID is plenty."""
-        return self.call_id.split("-")[0] if self.call_id else "????????"
+        return self.call_id.split("-")[0] if self.call_id else self._fallback_label
 
     async def __aenter__(self) -> "Call":
         return self
@@ -151,12 +156,22 @@ class Call:
         """
         return await self._recv()
 
+    async def _read_whole_frame(self) -> tuple[int, bytes]:
+        header = await self._reader.readexactly(HEADER_BYTES)
+        kind, length = unpack_header(header)
+        payload = await self._reader.readexactly(length) if length else b""
+        return kind, payload
+
     async def _read_frame(self) -> tuple[int, bytes] | None:
-        """One (kind, payload) off the wire, or None once the call is over."""
+        """One (kind, payload) off the wire, or None once the call is over.
+
+        The timeout covers the header *and* its payload as one deadline. Timing only the
+        header would leave the payload read unbounded, so an Asterisk that died between
+        writing a header and its 320 bytes would hang this call forever rather than ending
+        it -- rare, but a hung call holds the channel open until something else notices.
+        """
         try:
-            header = await asyncio.wait_for(
-                self._reader.readexactly(HEADER_BYTES), READ_TIMEOUT_SECONDS
-            )
+            return await asyncio.wait_for(self._read_whole_frame(), READ_TIMEOUT_SECONDS)
         except asyncio.IncompleteReadError:
             # Asterisk closed the socket without a hangup frame -- a crash, or the channel
             # going away underneath it. Same outcome for us as a clean hangup.
@@ -168,14 +183,6 @@ class Call:
             # long means the far end is gone.
             self._ended = True
             return None
-
-        kind, length = unpack_header(header)
-        try:
-            payload = await self._reader.readexactly(length) if length else b""
-        except asyncio.IncompleteReadError:
-            self._ended = True
-            return None
-        return kind, payload
 
     async def _recv(self, stop_after_uuid: bool = False) -> bytes | Dtmf | None:
         if self._pushback is not None:

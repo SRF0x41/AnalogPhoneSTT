@@ -109,6 +109,22 @@ messages are JSON:
 Binary from the stt machine is reserved for synthesized speech to play down the line.
 Nothing sends it yet; `Call.send()` is the hook that would write it to Asterisk.
 
+**Who closes the socket, and why it matters.** `call_end` is not the end of the
+conversation. Only hangup flushes the utterance the caller was still mid-way through, so the
+last transcript of every call is produced *after* `call_end` — which means we send
+`call_end` and then keep reading. The stt machine closes the socket once it has sent that
+final transcript, and that close is what ends the call here.
+`FINAL_TRANSCRIPT_GRACE_SECONDS` is only a backstop for a far side that never closes, and is
+deliberately longer than the stt machine's own `FINAL_DRAIN_TIMEOUT` so that side wins the
+race. Closing here on `call_end` instead would throw away the sentence most worth having.
+
+**Audio is queued, and dropped rather than waited on.** Frames go to the stt machine through
+a bounded queue (`OUTBOUND_QUEUE_FRAMES`, one second) drained by its own task. If the far
+side stops reading while its connection stays open, frames are dropped and counted
+(`dropped=` in the per-call summary) instead of the send blocking — a stalled write would
+reach back through the read loop into the AudioSocket, and a socket nobody reads backs up
+into Asterisk. A 20ms hole is spliced out and transcribes through; a stalled call does not.
+
 **The stt machine being down never drops a call.** A refused connection is logged once and
 the call continues untranscribed — someone is mid-sentence on the handset, and a dead
 transcriber is not a reason to hang up on them. The audio pump keeps draining either way,

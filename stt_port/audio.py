@@ -80,6 +80,9 @@ class Segmenter:
 
         self._preroll = np.zeros(self.preroll_samples, dtype=np.float32)
         self._preroll_pos = 0
+        # How much of the ring is audio from *this* gap between utterances. Reset on close,
+        # so a chunk can never be handed audio that predates the previous chunk.
+        self._preroll_filled = 0
         self._chunk = np.zeros(self.max_chunk_samples, dtype=np.float32)
         self._chunk_pos = 0
         self._open = False
@@ -90,6 +93,7 @@ class Segmenter:
         if n >= self.preroll_samples:
             self._preroll[:] = block[-self.preroll_samples:]
             self._preroll_pos = 0
+            self._preroll_filled = self.preroll_samples
             return
         end = self._preroll_pos + n
         if end <= self.preroll_samples:
@@ -99,9 +103,24 @@ class Segmenter:
             self._preroll[self._preroll_pos:] = block[:first]
             self._preroll[: end - self.preroll_samples] = block[first:]
         self._preroll_pos = end % self.preroll_samples
+        self._preroll_filled = min(self.preroll_samples, self._preroll_filled + n)
 
     def _preroll_ordered(self) -> np.ndarray:
+        """The audio immediately preceding the current block, oldest first.
+
+        Returns only what has actually been written since the last close -- a short gap
+        between utterances yields a short preroll rather than being padded out with
+        whatever the ring happened to still hold from an earlier part of the call.
+        """
+        if self._preroll_filled < self.preroll_samples:
+            # Not wrapped yet, so `_preroll_pos` is also the fill count: the valid samples
+            # are the leading ones, already in order.
+            return self._preroll[: self._preroll_filled]
         return np.concatenate([self._preroll[self._preroll_pos :], self._preroll[: self._preroll_pos]])
+
+    def _reset_preroll(self) -> None:
+        self._preroll_pos = 0
+        self._preroll_filled = 0
 
     def _append_chunk(self, block: np.ndarray) -> None:
         n = len(block)
@@ -116,6 +135,12 @@ class Segmenter:
         self._open = False
         self._chunk_pos = 0
         self._silence_run = 0
+        # The ring went unwritten for the whole utterance, so it still holds audio from
+        # before that utterance began. Dropping it matters most when a chunk closes on
+        # `max_chunk_samples` mid-sentence: the next block is loud, so without this the
+        # next chunk would open with up to `preroll_ms` of audio from 30 seconds ago
+        # spliced into the middle of continuous speech.
+        self._reset_preroll()
         return finished
 
     def flush(self) -> np.ndarray | None:
@@ -134,14 +159,18 @@ class Segmenter:
         loud = rms >= self.energy_threshold
 
         if not self._open:
-            self._write_preroll(block)
-            if loud:
-                self._open = True
-                self._silence_run = 0
-                pre = self._preroll_ordered()
-                self._chunk[: len(pre)] = pre
-                self._chunk_pos = len(pre)
-                self._append_chunk(block)
+            if not loud:
+                self._write_preroll(block)
+                return None
+            # The opening block is appended below, so it must *not* also go through the
+            # preroll first -- doing both put a duplicate copy of it at the head of every
+            # utterance. The preroll holds strictly the audio preceding this block.
+            self._open = True
+            self._silence_run = 0
+            pre = self._preroll_ordered()
+            self._chunk[: len(pre)] = pre
+            self._chunk_pos = len(pre)
+            self._append_chunk(block)
             return None
 
         self._append_chunk(block)

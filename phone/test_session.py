@@ -22,12 +22,20 @@ def frame(kind: int, payload: bytes = b"") -> bytes:
 
 
 class FakeStt:
-    """A WebSocket server standing in for the stt machine."""
+    """A WebSocket server standing in for the stt machine.
 
-    def __init__(self) -> None:
+    Follows the real server's hangup contract (`stt_port/server.py`): on `call_end` it may
+    send one last transcript -- the utterance the hangup interrupted -- and then closes the
+    socket itself. The phone side waits for that close, so a fake that held the connection
+    open would misrepresent every call as a 6-second linger.
+    """
+
+    def __init__(self, final_transcript: str | None = None, close_on_end: bool = True) -> None:
         self.audio: list[bytes] = []
         self.control: list[dict] = []
         self.connected = asyncio.Event()
+        self.final_transcript = final_transcript
+        self.close_on_end = close_on_end
         self._server = None
         self._ws = None
 
@@ -44,7 +52,15 @@ class FakeStt:
         try:
             async for message in websocket:
                 if isinstance(message, str):
-                    self.control.append(json.loads(message))
+                    control = json.loads(message)
+                    self.control.append(control)
+                    if control.get("type") == "call_end":
+                        if self.final_transcript is not None:
+                            await self.send_transcript(
+                                str(control.get("call_id", "")), self.final_transcript
+                            )
+                        if self.close_on_end:
+                            break
                 else:
                     self.audio.append(message)
         except Exception:
@@ -63,14 +79,19 @@ class SessionTestCase(unittest.IsolatedAsyncioTestCase):
     """Runs `handle_call` against a real AudioSocket connection and a fake stt machine."""
 
     stt_url_override: str | None = None
+    final_transcript: str | None = None
+    close_on_end: bool = True
 
     async def asyncSetUp(self):
-        self.stt = FakeStt()
+        self.stt = FakeStt(final_transcript=self.final_transcript, close_on_end=self.close_on_end)
         self.stt_url = await self.stt.start()
         self.transcripts: list[dict] = []
         self.finished = asyncio.Event()
 
+        self.call = None
+
         async def handler(call):
+            self.call = call
             await session.handle_call(
                 call,
                 stt_url=self.stt_url_override or self.stt_url,
@@ -161,6 +182,62 @@ class TestHappyPath(SessionTestCase):
         self.assertNotIn(b"9", self.stt.audio)
 
 
+class TestFinalTranscript(SessionTestCase):
+    """The utterance a hangup interrupts is usually the one worth having."""
+
+    final_transcript = "the last thing the caller said"
+
+    async def test_a_transcript_sent_after_call_end_still_reaches_the_sink(self):
+        # Regression: `close()` used to send call_end and shut the socket in one step, so a
+        # transcript the stt machine produced *after* the hangup -- which is every call's
+        # last utterance, since only hangup flushes it -- had nowhere to land.
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.send_audio(2)
+        await asyncio.sleep(0.2)
+        await self.hangup()
+
+        self.assertEqual([t["text"] for t in self.transcripts], [self.final_transcript])
+
+    async def test_call_end_is_sent_after_the_audio_it_follows(self):
+        # call_end overtaking queued frames would truncate that same final utterance.
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.send_audio(5)
+        await self.hangup()
+
+        self.assertEqual(len(self.stt.audio), 5)
+        self.assertEqual(self.stt.control[-1]["type"], "call_end")
+
+
+class TestSttNeverCloses(SessionTestCase):
+    """A far side that ignores the contract must not hang the call forever."""
+
+    close_on_end = False
+
+    async def test_the_grace_period_is_bounded(self):
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.send_audio(1)
+        original = session.FINAL_TRANSCRIPT_GRACE_SECONDS
+        session.FINAL_TRANSCRIPT_GRACE_SECONDS = 0.3
+        try:
+            await self.hangup()  # would block forever if the wait were unbounded
+        finally:
+            session.FINAL_TRANSCRIPT_GRACE_SECONDS = original
+
+
+class TestBackpressure(SessionTestCase):
+    async def test_a_stalled_link_does_not_stop_the_audiosocket_being_read(self):
+        # A socket nobody reads backs up into Asterisk, so a far side that stops reading
+        # must cost dropped frames, not a stalled call.
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.send_audio(session.OUTBOUND_QUEUE_FRAMES * 3)
+        await asyncio.sleep(0.3)
+        await self.hangup()
+
+        # Every frame was read off the AudioSocket even though far more were offered than
+        # the outbound queue can hold.
+        self.assertEqual(self.call.frames_in, session.OUTBOUND_QUEUE_FRAMES * 3)
+
+
 class TestSttUnavailable(SessionTestCase):
     """A dead transcriber must not be able to drop a call."""
 
@@ -198,6 +275,42 @@ class TestSttDropsMidCall(SessionTestCase):
         await self.hangup()  # and the call still ends cleanly
 
         self.assertGreaterEqual(len(self.stt.audio), 2)
+
+
+class TestOutboundQueueIsBounded(unittest.IsolatedAsyncioTestCase):
+    """A far side that stops draining must cost frames, not stall the call.
+
+    Loopback is too fast to ever fill the queue, so the stall is injected directly: a
+    websocket whose `send` never completes, which is what a stt machine that has wedged
+    with its connection still open looks like from here.
+    """
+
+    async def test_frames_are_dropped_and_the_caller_is_never_blocked(self):
+        link = session.SttLink("ws://not-used/", "call-1")
+
+        class WedgedWebSocket:
+            async def send(self, _data):
+                await asyncio.sleep(3600)
+
+        link._ws = WedgedWebSocket()
+        link._start_pump()
+        offered = session.OUTBOUND_QUEUE_FRAMES * 3
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for _ in range(offered):
+            await link.send_audio(b"\x00" * 320)
+        elapsed = loop.time() - started
+
+        try:
+            self.assertLess(elapsed, 0.5, "send_audio blocked on the wedged socket")
+            self.assertEqual(link.frames_sent, 0, "the wedged send cannot have completed")
+            # At most the queue's depth (plus one in the pump's hand) was ever held.
+            self.assertGreaterEqual(
+                link.frames_dropped, offered - session.OUTBOUND_QUEUE_FRAMES - 1
+            )
+        finally:
+            await link.close()
 
 
 class TestSinks(unittest.TestCase):

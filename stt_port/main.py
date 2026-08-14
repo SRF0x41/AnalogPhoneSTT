@@ -112,6 +112,11 @@ def consume_chunks(backend, q: Queue, args: argparse.Namespace, sink=None) -> No
     `sink(call_id, record)` is an optional second destination for each transcript, used by
     the `ws` source to return it to the phone machine. It runs on this thread, so it must
     not block -- `WebSocketSource.emit` only schedules the send.
+
+    The sink is called for every chunk, with `record=None` for one that transcribed to
+    nothing. That is not a transcript and nothing is sent for it, but the sink is how the
+    `ws` source learns a chunk is finished with, and a call whose last utterance was line
+    noise would otherwise hold its socket open waiting for a transcript that never comes.
     """
     while True:
         item = q.get()
@@ -136,14 +141,15 @@ def consume_chunks(backend, q: Queue, args: argparse.Namespace, sink=None) -> No
         # Non-speech that crossed the energy threshold (line noise, a door, a cough)
         # transcribes to nothing. Emitting a blank line for it is just noise of another
         # kind -- especially on a phone line, where the noise floor guarantees some.
-        if not text:
-            if args.verbose:
-                print("  [skipped: empty transcript]", file=sys.stderr)
-            continue
-
-        record = emit_transcript(text, target, closed_at, call_id, args)
+        record = None
+        if text:
+            record = emit_transcript(text, target, closed_at, call_id, args)
+        elif args.verbose:
+            print("  [skipped: empty transcript]", file=sys.stderr)
         if sink is not None:
             sink(call_id, record)
+        if record is None:
+            continue
         t_print = time.perf_counter()
 
         if args.verbose:
@@ -197,6 +203,9 @@ async def _run_ws_loop(backend, args: argparse.Namespace) -> None:
         meter=args.meter,
         idle_timeout=args.idle_timeout,
         verbose=args.verbose,
+        # Only when something is actually transcribing: --meter drains no queue, so a call
+        # would wait out the whole timeout on every hangup for a transcript that isn't coming.
+        final_drain_timeout=0.0 if args.meter else server.FINAL_DRAIN_TIMEOUT,
     )
     async with source:
         if args.meter:

@@ -28,6 +28,22 @@
 >   success from total failure, which is why "the sender printed no errors" was
 >   never evidence of anything.
 >
+> **What did *not* outlive it: §3's case for UDP over TCP.** That argument is
+> sound, and it is about *playback* — a retransmitted frame of speech arrives
+> after the moment it belonged to, and the listener hears a stall. Nothing plays
+> this audio. The stt machine buffers frames into utterances, won't close one
+> until 500ms of silence has passed, and then spends another 0.5–2s in inference;
+> a TCP retransmit on a wired LAN costs well under a millisecond. The
+> head-of-line blocking §3 warns about is real and invisible at this timescale,
+> while the dropped frame UDP accepts in exchange is a permanent hole in the
+> middle of a word that Whisper never gets to see. So the current design is on
+> TCP deliberately, and §3 should not be read as an argument to move back.
+>
+> The one place §3's reasoning still holds is the direction that isn't built:
+> synthesized speech played *down* the line goes straight into the caller's ear,
+> where a late frame is an audible click. A UDP side-channel would be defensible
+> there — see §9.
+>
 > Read the rest as history.
 
 RedPhone runs on two machines that talk over the LAN. This document explains

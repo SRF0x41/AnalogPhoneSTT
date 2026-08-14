@@ -21,7 +21,7 @@ One WebSocket connection per call, opened by the phone machine.
   |---|---|---|
   | phone -> here | `call_start` | `call_id`, `rate`, `direction` |
   | phone -> here | `call_end`   | `reason` |
-  | here -> phone | `transcript` | `call_id`, `text`, `dur_ms`, `latency_ms` |
+  | here -> phone | `transcript` | `call`, `text`, `dur_ms`, `latency_ms` |
   | here -> phone | `error`      | `message` |
 
 Binary in the here->phone direction is reserved for synthesized audio to play down the
@@ -44,7 +44,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 import time
+import uuid
 from queue import Queue
 from typing import Any, Callable
 
@@ -74,6 +76,14 @@ DEFAULT_IDLE_TIMEOUT = 2.0
 
 # Meter mode prints one aggregated line per this many blocks (10 * 20ms = 200ms).
 _METER_BLOCKS = 10
+
+# How long a finished call's socket is held open waiting for its last utterance to come back
+# from the transcriber. Hangup flushes a partial utterance (`Segmenter.flush`), but inference
+# runs on another thread and takes a second or more -- close the socket the moment the call
+# ends and that final sentence, usually the one worth having, is transcribed into a socket
+# nobody is holding. Must be shorter than the phone machine's own grace period
+# (`session.FINAL_TRANSCRIPT_GRACE_SECONDS`) so this side is the one that closes.
+FINAL_DRAIN_TIMEOUT = 5.0
 
 
 def pcm16_to_float32(payload: bytes) -> np.ndarray:
@@ -136,6 +146,7 @@ class WebSocketSource:
         meter: bool = False,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         verbose: bool = False,
+        final_drain_timeout: float = 0.0,
     ) -> None:
         self._queue = out_queue
         self._host = host
@@ -145,11 +156,19 @@ class WebSocketSource:
         self._meter = meter
         self._idle_timeout = idle_timeout
         self._verbose = verbose
+        # Off unless a transcriber is attached: with nothing draining the queue, waiting for
+        # a transcript that can never arrive would just stall every hangup by the timeout.
+        self._final_drain_timeout = final_drain_timeout
 
         self._server: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sockets: dict[str, Any] = {}  # call_id -> websocket, for the transcript path
         self._meter_window: list[float] = []
+        # Chunks queued but not yet transcribed, per call. Written from the event loop
+        # (queueing) and from `consume_chunks`' thread (completion), hence the lock.
+        self._pending: dict[str, int] = {}
+        self._drained: dict[str, asyncio.Event] = {}
+        self._pending_lock = threading.Lock()
 
     # --- lifecycle ---------------------------------------------------------------------
 
@@ -181,22 +200,86 @@ class WebSocketSource:
 
     # --- transcripts, back out to the phone machine ------------------------------------
 
-    def emit(self, call_id: str | None, record: dict) -> None:
+    def emit(self, call_id: str | None, record: dict | None) -> None:
         """Send one finished transcript back. Called from `consume_chunks`' thread.
 
         Thread-affine on purpose: websockets objects belong to the event loop, so the send
         is scheduled onto it rather than performed here. Failures are logged and dropped --
         a call whose socket has already closed still transcribed fine, and there is nobody
         left to tell.
+
+        `record` is None when the chunk transcribed to nothing (line noise that crossed the
+        energy threshold). Nothing is sent, but it still counts as that chunk being finished
+        with -- otherwise a call whose last utterance was noise would hold its socket open
+        for the full drain timeout waiting for a transcript that is never coming.
         """
-        websocket = self._sockets.get(call_id) if call_id is not None else None
-        if websocket is None or self._loop is None:
-            return
-        message = json.dumps({"type": "transcript", **record})
         try:
-            asyncio.run_coroutine_threadsafe(websocket.send(message), self._loop)
-        except RuntimeError:
-            pass  # loop already closed; shutting down
+            websocket = self._sockets.get(call_id) if call_id is not None else None
+            if record is None or websocket is None or self._loop is None:
+                return
+            message = json.dumps({"type": "transcript", **record})
+            try:
+                future = asyncio.run_coroutine_threadsafe(websocket.send(message), self._loop)
+            except RuntimeError:
+                return  # loop already closed; shutting down
+            # Retrieve the result, or a failed send surfaces later as an "exception was
+            # never retrieved" warning from the GC instead of being handled here.
+            future.add_done_callback(self._log_send_failure)
+        finally:
+            self._chunk_done(call_id)
+
+    def _log_send_failure(self, future) -> None:
+        try:
+            future.result()
+        except Exception as exc:  # noqa: BLE001 - the call hung up mid-send; nothing to do
+            if self._verbose:
+                print(f"[ws] transcript send failed: {exc!r}", file=sys.stderr)
+
+    # --- tracking work in flight, so hangup can wait for it ----------------------------
+
+    def _queue_chunk(self, call_id: str, chunk) -> None:
+        with self._pending_lock:
+            self._pending[call_id] = self._pending.get(call_id, 0) + 1
+        self._queue.put((chunk, WIRE_RATE, time.perf_counter(), call_id))
+
+    def _chunk_done(self, call_id: str | None) -> None:
+        """One queued chunk has been transcribed. Runs on `consume_chunks`' thread."""
+        if call_id is None:
+            return
+        with self._pending_lock:
+            remaining = self._pending.get(call_id, 0) - 1
+            if remaining > 0:
+                self._pending[call_id] = remaining
+                return
+            self._pending.pop(call_id, None)
+            event = self._drained.get(call_id)
+        if event is not None and self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass  # loop already closed; shutting down
+
+    async def _wait_for_pending(self, call_id: str) -> None:
+        """Hold the connection open until this call's queued chunks have been transcribed."""
+        if self._final_drain_timeout <= 0:
+            return
+        with self._pending_lock:
+            if not self._pending.get(call_id):
+                return
+            event = self._drained.setdefault(call_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), self._final_drain_timeout)
+        except asyncio.TimeoutError:
+            if self._verbose:
+                print(
+                    f"[ws] call {call_id}: gave up waiting for the last transcript after "
+                    f"{self._final_drain_timeout:.0f}s",
+                    file=sys.stderr,
+                )
+        finally:
+            with self._pending_lock:
+                self._drained.pop(call_id, None)
+                self._pending.pop(call_id, None)
 
     # --- receiving ---------------------------------------------------------------------
 
@@ -211,6 +294,10 @@ class WebSocketSource:
                     control = self._parse_control(message)
                     kind = control.get("type")
                     if kind == "call_start":
+                        # Cancelling first matters if a client sends call_start twice on one
+                        # connection: two watchers on one call double-flush its utterances.
+                        if idle_task is not None:
+                            idle_task.cancel()
                         call = self._start_call(control)
                         self._sockets[call.call_id] = websocket
                         idle_task = asyncio.create_task(self._watch_idle(lambda: call))
@@ -222,7 +309,7 @@ class WebSocketSource:
                 if call is None:
                     # Audio before call_start: the phone machine restarted mid-call, or is
                     # a test client that doesn't bother. The audio is real -- adopt it.
-                    call = self._start_call({"call_id": f"anon-{id(websocket) & 0xFFFFFF:06x}"})
+                    call = self._start_call({"call_id": f"anon-{uuid.uuid4().hex[:6]}"})
                     self._sockets[call.call_id] = websocket
                     idle_task = asyncio.create_task(self._watch_idle(lambda: call))
                     print(f"[ws] call {call.call_id} started (mid-stream)", file=sys.stderr)
@@ -237,8 +324,14 @@ class WebSocketSource:
             if idle_task is not None:
                 idle_task.cancel()
             if call is not None:
-                self._sockets.pop(call.call_id, None)
+                # Order matters: flush the tail utterance, then wait for it to come back
+                # from the transcriber, and only then drop the socket. Unregistering first
+                # means `emit` has nowhere to send the last thing the caller said.
                 self._end_call(call, reason)
+                try:
+                    await self._wait_for_pending(call.call_id)
+                finally:
+                    self._sockets.pop(call.call_id, None)
 
     def _parse_control(self, message: str) -> dict:
         try:
@@ -250,7 +343,10 @@ class WebSocketSource:
             return {}
 
     def _start_call(self, control: dict) -> _Call:
-        call_id = str(control.get("call_id") or f"call-{int(time.time()) & 0xFFFFFF:06x}")
+        # Random, not time-derived: two unannounced calls starting in the same second would
+        # otherwise share an id, and `_sockets` would route one call's transcripts to the
+        # other -- or drop them when the first to end unregisters the shared key.
+        call_id = str(control.get("call_id") or f"call-{uuid.uuid4().hex[:6]}")
         rate = control.get("rate", WIRE_RATE)
         if rate != WIRE_RATE:
             # Everything downstream assumes the wire rate; a sender at another rate would
@@ -269,7 +365,7 @@ class WebSocketSource:
             return
         chunk = call.segmenter.process(block)
         if chunk is not None:
-            self._queue.put((chunk, WIRE_RATE, time.perf_counter(), call.call_id))
+            self._queue_chunk(call.call_id, chunk)
 
     def _meter_block(self, block: np.ndarray) -> None:
         self._meter_window.append(float(np.sqrt(np.mean(np.square(block)))) if len(block) else 0.0)
@@ -297,13 +393,17 @@ class WebSocketSource:
             if time.monotonic() - call.last_audio >= self._idle_timeout:
                 tail = call.segmenter.flush()
                 if tail is not None and not self._meter:
-                    self._queue.put((tail, WIRE_RATE, time.perf_counter(), call.call_id))
+                    self._queue_chunk(call.call_id, tail)
                 call.last_audio = time.monotonic()  # don't re-flush every tick
 
     def _end_call(self, call: _Call, reason: str) -> None:
-        """Close the call, flushing an utterance left open by hangup."""
+        """Close the call, flushing an utterance left open by hangup.
+
+        The flushed tail is queued like any other chunk, which is what lets `_handle` wait
+        for its transcript before the socket goes away.
+        """
         self._meter_window = []
         tail = call.segmenter.flush()
         if tail is not None and not self._meter:
-            self._queue.put((tail, WIRE_RATE, time.perf_counter(), call.call_id))
+            self._queue_chunk(call.call_id, tail)
         print(f"[ws] call {call.call_id} ended ({reason}) {call.stats()}", file=sys.stderr)

@@ -37,6 +37,23 @@ from . import audiosocket, config
 # Short on purpose: this is a LAN, and the caller is already talking.
 CONNECT_TIMEOUT_SECONDS = 2.0
 
+# After hangup, how long to keep the socket open for the last utterance's transcript. The
+# stt machine flushes the partial utterance hangup left open, transcribes it, sends it, and
+# then closes -- so this is a backstop, not the normal path, and must be longer than that
+# machine's own `server.FINAL_DRAIN_TIMEOUT` or we would hang up on it mid-answer.
+FINAL_TRANSCRIPT_GRACE_SECONDS = 6.0
+
+# Audio waiting to go to the stt machine, in 20ms frames. One second is far more slack than
+# a LAN needs; the point is the bound, not the depth -- see `send_audio`.
+OUTBOUND_QUEUE_FRAMES = 50
+
+# How long to let queued audio finish sending before announcing the call is over, so the
+# last frames of speech don't lose the race with `call_end`.
+FLUSH_TIMEOUT_SECONDS = 2.0
+
+# Ceiling on an inline control-message send. See `_send_text`.
+TEXT_SEND_TIMEOUT_SECONDS = 2.0
+
 TranscriptSink = Callable[[dict], Any]
 
 
@@ -62,7 +79,10 @@ class SttLink:
         self._call_id = call_id
         self._verbose = verbose
         self._ws: Any = None
+        self._outbox: asyncio.Queue | None = None
+        self._pump: asyncio.Task | None = None
         self.frames_sent = 0
+        self.frames_dropped = 0
         self.transcripts = 0
 
     @property
@@ -74,7 +94,7 @@ class SttLink:
 
         try:
             self._ws = await asyncio.wait_for(connect(self._url), CONNECT_TIMEOUT_SECONDS)
-        except (OSError, asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - refused, timed out, bad URL: all the same
             print(
                 f"[session] call {self._call_id}: no stt at {self._url} ({exc}) -- "
                 "continuing untranscribed",
@@ -88,25 +108,60 @@ class SttLink:
             "rate": audiosocket.RATE,
             "direction": "inbound",
         })
+        self._start_pump()
         return True
 
+    def _start_pump(self) -> None:
+        self._outbox = asyncio.Queue(maxsize=OUTBOUND_QUEUE_FRAMES)
+        self._pump = asyncio.create_task(self._drain_outbox())
+
     async def send_audio(self, pcm: bytes) -> None:
-        if self._ws is None:
+        """Hand one frame to the stt machine, dropping it rather than waiting for room.
+
+        Sending straight down the socket would make the caller's audio path only as fast as
+        the slowest thing on the far end: a stt machine that stops reading while its
+        connection stays open would block this call's read loop, and an AudioSocket nobody
+        reads backs up into Asterisk -- the exact failure this module exists to avoid. So
+        frames go through a bounded queue, and when it fills the frame is dropped.
+
+        Dropping is the right loss: a 20ms hole is spliced out and transcribes through
+        (`docs/NETWORKING.md` §5), while stalling the read loop degrades the live call.
+        """
+        if self._ws is None or self._outbox is None:
             return
         try:
-            await self._ws.send(pcm)
-            self.frames_sent += 1
-        except Exception as exc:  # noqa: BLE001 - the link died mid-call; the call has not
-            if self._verbose:
-                print(f"[session] call {self._call_id}: stt link lost ({exc})", file=sys.stderr)
-            self._ws = None
+            self._outbox.put_nowait(pcm)
+        except asyncio.QueueFull:
+            self.frames_dropped += 1
+
+    async def _drain_outbox(self) -> None:
+        """Own the socket's write side, so a slow send can never reach the read loop."""
+        assert self._outbox is not None
+        while True:
+            pcm = await self._outbox.get()
+            try:
+                if self._ws is not None:
+                    await self._ws.send(pcm)
+                    self.frames_sent += 1
+            except Exception as exc:  # noqa: BLE001 - the link died mid-call; the call has not
+                if self._verbose:
+                    print(f"[session] call {self._call_id}: stt link lost ({exc})", file=sys.stderr)
+                self._ws = None
+            finally:
+                self._outbox.task_done()
 
     async def _send_text(self, payload: dict) -> None:
+        """Send one control message, bounded.
+
+        Bounded because audio has a queue to be dropped into but control messages are sent
+        inline: a far side that has wedged with its connection still open would otherwise
+        make `call_start` stall the call's first frames, and `call_end` stall its teardown.
+        """
         if self._ws is None:
             return
         try:
-            await self._ws.send(json.dumps(payload))
-        except Exception:  # noqa: BLE001
+            await asyncio.wait_for(self._ws.send(json.dumps(payload)), TEXT_SEND_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - timed out or the socket is gone; same outcome
             self._ws = None
 
     async def receive_transcripts(self, sink: TranscriptSink) -> None:
@@ -131,10 +186,33 @@ class SttLink:
         except Exception:  # noqa: BLE001 - a closed socket is the normal way out
             pass
 
-    async def close(self, reason: str = "hangup") -> None:
+    async def finish(self, reason: str = "hangup") -> None:
+        """Announce the call is over, but leave the socket open.
+
+        Split from `close` on purpose. The stt machine answers `call_end` by flushing the
+        utterance hangup interrupted, transcribing it, sending it back, and only then
+        closing -- so closing here would cut off the final sentence, which is usually the
+        one worth having. `handle_call` waits for the far side to close instead.
+        """
+        if self._pump is not None:
+            # Queued audio first: `call_end` overtaking the last frames of speech would
+            # truncate the very utterance this whole handshake exists to preserve.
+            if self._outbox is not None and self._ws is not None:
+                try:
+                    await asyncio.wait_for(self._outbox.join(), FLUSH_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+            self._pump.cancel()
+            self._pump = None
+            self._outbox = None  # any late frame is now a cheap no-op, not a silent queue
+        await self._send_text({"type": "call_end", "reason": reason})
+
+    async def close(self) -> None:
+        if self._pump is not None:
+            self._pump.cancel()
+            self._pump = None
         if self._ws is None:
             return
-        await self._send_text({"type": "call_end", "reason": reason})
         ws, self._ws = self._ws, None
         try:
             await ws.close()
@@ -172,16 +250,24 @@ async def handle_call(
         reason = str(exc)
         print(f"[session] call {call_id}: {exc}", file=sys.stderr)
     finally:
-        await link.close(reason)
-        # The stt machine may still be transcribing the last utterance when the caller
-        # hangs up -- that final sentence is usually the one worth having, so give the
-        # already-closing socket a moment to deliver it rather than cancelling outright.
+        # Announce the hangup but keep the socket open: the stt machine still owes us the
+        # transcript of the utterance the hangup interrupted, and it closes the connection
+        # itself once that has been sent -- which is what ends `reader` below.
+        await link.finish(reason)
         try:
-            await asyncio.wait_for(reader, timeout=3)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(reader, timeout=FINAL_TRANSCRIPT_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            pass  # wait_for has already cancelled it
+        except asyncio.CancelledError:
+            # Ours to propagate, not to swallow -- catching it here would make this call
+            # uncancellable during shutdown.
             reader.cancel()
-        print(
-            f"[session] call {call_id} ended ({reason}) "
-            f"frames={call.frames_in} sent={link.frames_sent} transcripts={link.transcripts}",
-            file=sys.stderr,
-        )
+            raise
+        finally:
+            await link.close()
+            dropped = f" dropped={link.frames_dropped}" if link.frames_dropped else ""
+            print(
+                f"[session] call {call_id} ended ({reason}) frames={call.frames_in} "
+                f"sent={link.frames_sent}{dropped} transcripts={link.transcripts}",
+                file=sys.stderr,
+            )
