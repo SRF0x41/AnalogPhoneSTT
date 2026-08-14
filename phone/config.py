@@ -22,7 +22,7 @@ STT_URL = os.environ.get("ANALOGPHONE_STT_URL", "ws://192.168.50.120:9099/")
 # asterisk/ari.conf.sample.
 ARI_URL = os.environ.get("ANALOGPHONE_ARI_URL", "http://127.0.0.1:8088/ari")
 ARI_USER = os.environ.get("ANALOGPHONE_ARI_USER", "analogphone")
-ARI_PASSWORD = os.environ.get("ANALOGPHONE_ARI_PASSWORD", "")
+ARI_PASSWORD = os.environ.get("ANALOGPHONE_ARI_PASSWORD", "userpass1")
 
 # The PJSIP endpoint for the HT801, and the dialplan context an originated call is dropped
 # into once it answers. Must match asterisk/extensions.conf.sample.
