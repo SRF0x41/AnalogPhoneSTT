@@ -1,0 +1,42 @@
+; AnalogPhoneSTT dial plan -- /etc/asterisk/extensions.conf
+;
+; Apply by hand (needs root), then `asterisk -rx "dialplan reload"`.
+;
+; Both contexts do the same thing: answer the channel and hand its audio to the
+; AudioSocket server in the `phone` package. They differ only in how the call got
+; here -- the HT801 dialing in, or ARI originating out.
+;
+; ${UUID()} needs func_uuid.so (shipped with Asterisk). It has to be a real UUID:
+; AudioSocket runs uuid_parse() on it and refuses anything else, so ${UNIQUEID}
+; -- which looks like 1234567890.12 -- will not work here.
+;
+; AudioSocket's audio is signed linear, 8kHz, mono, which is the analog line's own
+; rate. Nothing upstream resamples it; the stt machine does that once per utterance.
+
+[from-phone]
+; The HT801 is configured to auto-dial 100 when the handset is lifted.
+exten => 100,1,NoOp(phone -> audiosocket)
+ same  =>     n,Answer()
+ same  =>     n,AudioSocket(${UUID()},127.0.0.1:9092)
+ same  =>     n,Hangup()
+
+[analogphone-outbound]
+; `python -m phone --call` originates PJSIP/phone into here via ARI; the HT801 rings,
+; and on answer the call lands on the same AudioSocket server as an inbound one.
+exten => s,1,NoOp(outbound -> audiosocket)
+ same  =>    n,Answer()
+ same  =>    n,AudioSocket(${UUID()},127.0.0.1:9092)
+ same  =>    n,Hangup()
+
+; --- what this replaced -----------------------------------------------------------
+;
+; [from-phone]                              [from-assistant]
+; exten => 100,1,NoOp(phone -> assistant)   exten => 200,1,NoOp(assistant -> phone)
+;  same => n,Dial(PJSIP/assistant,30)        same => n,Dial(PJSIP/phone,30)
+;  same => n,Hangup()                        same => n,Hangup()
+;
+; `PJSIP/assistant` was a pyVoIP process registering as a second SIP endpoint to this
+; same Asterisk, so it could terminate RTP in Python. AudioSocket hands over the
+; decoded audio directly, so nothing registers as `assistant` any more. The endpoint
+; can stay in pjsip.conf until the new path is verified -- it costs nothing and keeps
+; a rollback available (see the `archive/pyvoip` tag).

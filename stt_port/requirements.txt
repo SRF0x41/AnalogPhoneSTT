@@ -1,0 +1,19 @@
+# The speech-to-text machine (Apple Silicon, 192.168.50.120). Nothing here is telephony-aware:
+# Asterisk, the HT801 and the call audio all live on the phone machine, with the `phone` package.
+# This one takes PCM16 in over a WebSocket and hands text back on the same socket.
+numpy==2.5.2
+scipy==1.18.0
+
+# The link to the phone machine. Carries binary audio one way and JSON transcripts the other.
+websockets==17.0.1
+
+# --backend mlx (the default here). Runs large-v3-turbo on the M-series GPU via Metal.
+mlx-whisper==0.4.3
+
+# --source mic only. The network path needs no audio hardware and doesn't import this.
+sounddevice==0.5.5
+
+# Fallback backend for a machine without MLX: --backend whisper --device cpu (or cuda:N on a
+# CUDA box). Uncomment if you need it -- it pulls in CTranslate2, which is a large dependency
+# to install for a path that is several times slower than MLX on this hardware.
+# faster-whisper==1.2.1

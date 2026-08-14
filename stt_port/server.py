@@ -1,0 +1,309 @@
+"""WebSocket audio source: call audio arriving from the phone machine.
+
+The phone machine terminates the call (Asterisk hands it the media over AudioSocket) and
+forwards each answered call's audio here. This module is the receiving half: it converts
+PCM16 payloads to float32, runs them through the same `Segmenter` the mic path uses, and
+pushes closed utterances onto the same queue -- so `consume_chunks` cannot tell a phone
+call from a microphone. Finished transcripts go back out on the same socket.
+
+## The link
+
+One WebSocket connection per call, opened by the phone machine.
+
+- **Binary messages are audio**: PCM16, little-endian, mono, 8kHz -- 20ms (320-byte)
+  frames as they came off the line. Not resampled in transit: 8kHz is the analog line's
+  native rate, and upsampling before the network would double the bytes without adding
+  information. `resample_to_target` lifts each *closed utterance* to 16kHz for Whisper,
+  once, off the realtime path.
+- **Text messages are JSON control**, `{"type": ...}`:
+
+  | direction | type | fields |
+  |---|---|---|
+  | phone -> here | `call_start` | `call_id`, `rate`, `direction` |
+  | phone -> here | `call_end`   | `reason` |
+  | here -> phone | `transcript` | `call_id`, `text`, `dur_ms`, `latency_ms` |
+  | here -> phone | `error`      | `message` |
+
+Binary in the here->phone direction is reserved for synthesized audio to play down the
+line; nothing sends it yet, and the phone side already knows how to write it to Asterisk.
+
+## Why this is so much smaller than the UDP receiver it replaces
+
+The previous design (`docs/NETWORKING.md`, tag `archive/pyvoip`) carried the same audio
+over UDP with a hand-written 16-byte header, and had to solve framing, sequence numbers,
+loss and late-frame accounting, an idle timeout, and a heartbeat to distinguish "no call"
+from "link down". A WebSocket supplies message framing, ordering, a binary/text
+discriminator, and liveness (ping/pong plus TCP's own connection state), so none of that
+code exists here. What survives is the part that was always about *speech* rather than
+about sockets: a call can go quiet without ending, so `idle_timeout` still flushes an
+utterance that hangup left open.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import time
+from queue import Queue
+from typing import Any, Callable
+
+import numpy as np
+
+from .audio import HANGOVER_MS, TARGET_SAMPLE_RATE, Segmenter
+
+# The rate the phone machine sends at: the analog line's own rate, unresampled.
+WIRE_RATE = 8000
+
+# 20ms at WIRE_RATE. One AudioSocket frame maps to exactly one of these, but audio is
+# re-blocked rather than trusted to arrive that way, so the segmenter's timing math holds
+# regardless of how the sender chunks it.
+BLOCK_SAMPLES = 160
+
+DEFAULT_PORT = 9099
+
+# Starting point only -- expect to tune this per line with --meter. A phone line's noise
+# floor sits well above a microphone's, but how far above depends on the ATA's gain.
+DEFAULT_PHONE_ENERGY_THRESHOLD = 0.01
+
+# A call with no audio for this long is treated as ended. TCP tells us when the phone
+# machine goes away, so unlike the UDP version this is not about detecting a dead link --
+# it is about a call that stalls mid-utterance without closing, whose last words would
+# otherwise never be flushed.
+DEFAULT_IDLE_TIMEOUT = 2.0
+
+# Meter mode prints one aggregated line per this many blocks (10 * 20ms = 200ms).
+_METER_BLOCKS = 10
+
+
+def pcm16_to_float32(payload: bytes) -> np.ndarray:
+    """Wire PCM16 bytes -> the float32 in [-1, 1] the backends and Segmenter expect."""
+    return np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+
+
+class _Call:
+    """Per-call receive state: its segmenter, its block accumulator, its tallies."""
+
+    def __init__(self, call_id: str, energy_threshold: float, hangover_ms: float) -> None:
+        self.call_id = call_id
+        self.segmenter = Segmenter(
+            native_rate=WIRE_RATE,
+            block_size=BLOCK_SAMPLES,
+            energy_threshold=energy_threshold,
+            hangover_ms=hangover_ms,
+        )
+        self.blocks = 0
+        self.last_audio = time.monotonic()
+        self._residue = b""
+
+    def blocks_from(self, payload: bytes):
+        """Yield fixed-size float32 blocks, carrying any partial block to the next call.
+
+        Fixed blocks matter because `Segmenter` counts *blocks* of silence, not
+        milliseconds: feed it uneven blocks and the hangover stops meaning 500ms.
+        """
+        self.last_audio = time.monotonic()
+        data = self._residue + payload
+        step = BLOCK_SAMPLES * 2
+        whole = len(data) - (len(data) % step)
+        self._residue = data[whole:]
+        for start in range(0, whole, step):
+            self.blocks += 1
+            yield pcm16_to_float32(data[start : start + step])
+
+    def stats(self) -> str:
+        return f"blocks={self.blocks} ({self.blocks * BLOCK_SAMPLES / WIRE_RATE:.1f}s)"
+
+
+class WebSocketSource:
+    """Serves call audio from the phone machine into the dictation queue.
+
+    Mirrors `audio.open_stream`'s contract -- a background producer pushing closed
+    utterances onto a shared queue -- so `consume_chunks` works against either source
+    unchanged. A `None` on the queue means this source is finished.
+
+    Transcription happens on `consume_chunks`' thread, not here, so a two-second inference
+    never stalls the socket: frames keep draining into the segmenter while the GPU works.
+    """
+
+    def __init__(
+        self,
+        out_queue: Queue,
+        host: str = "0.0.0.0",
+        port: int = DEFAULT_PORT,
+        energy_threshold: float = DEFAULT_PHONE_ENERGY_THRESHOLD,
+        hangover_ms: float = HANGOVER_MS,
+        meter: bool = False,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        verbose: bool = False,
+    ) -> None:
+        self._queue = out_queue
+        self._host = host
+        self._port = port
+        self._energy_threshold = energy_threshold
+        self._hangover_ms = hangover_ms
+        self._meter = meter
+        self._idle_timeout = idle_timeout
+        self._verbose = verbose
+
+        self._server: Any = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._sockets: dict[str, Any] = {}  # call_id -> websocket, for the transcript path
+        self._meter_window: list[float] = []
+
+    # --- lifecycle ---------------------------------------------------------------------
+
+    async def start(self) -> "WebSocketSource":
+        from websockets.asyncio.server import serve
+
+        self._loop = asyncio.get_running_loop()
+        self._server = await serve(self._handle, self._host, self._port)
+        return self
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+        self._queue.put(None)
+
+    async def __aenter__(self) -> "WebSocketSource":
+        return await self.start()
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.stop()
+
+    @property
+    def bound_port(self) -> int:
+        """The port actually bound -- meaningful when port 0 was requested (the tests do)."""
+        if self._server is None:
+            return self._port
+        return next(iter(self._server.sockets)).getsockname()[1]
+
+    # --- transcripts, back out to the phone machine ------------------------------------
+
+    def emit(self, call_id: str | None, record: dict) -> None:
+        """Send one finished transcript back. Called from `consume_chunks`' thread.
+
+        Thread-affine on purpose: websockets objects belong to the event loop, so the send
+        is scheduled onto it rather than performed here. Failures are logged and dropped --
+        a call whose socket has already closed still transcribed fine, and there is nobody
+        left to tell.
+        """
+        websocket = self._sockets.get(call_id) if call_id is not None else None
+        if websocket is None or self._loop is None:
+            return
+        message = json.dumps({"type": "transcript", **record})
+        try:
+            asyncio.run_coroutine_threadsafe(websocket.send(message), self._loop)
+        except RuntimeError:
+            pass  # loop already closed; shutting down
+
+    # --- receiving ---------------------------------------------------------------------
+
+    async def _handle(self, websocket) -> None:
+        """One connection: one call, from the phone machine's call_start to hangup."""
+        call: _Call | None = None
+        reason = "socket closed"
+        idle_task = None
+        try:
+            async for message in websocket:
+                if isinstance(message, str):
+                    control = self._parse_control(message)
+                    kind = control.get("type")
+                    if kind == "call_start":
+                        call = self._start_call(control)
+                        self._sockets[call.call_id] = websocket
+                        idle_task = asyncio.create_task(self._watch_idle(lambda: call))
+                    elif kind == "call_end":
+                        reason = str(control.get("reason", "hangup"))
+                        break
+                    continue
+
+                if call is None:
+                    # Audio before call_start: the phone machine restarted mid-call, or is
+                    # a test client that doesn't bother. The audio is real -- adopt it.
+                    call = self._start_call({"call_id": f"anon-{id(websocket) & 0xFFFFFF:06x}"})
+                    self._sockets[call.call_id] = websocket
+                    idle_task = asyncio.create_task(self._watch_idle(lambda: call))
+                    print(f"[ws] call {call.call_id} started (mid-stream)", file=sys.stderr)
+
+                for block in call.blocks_from(message):
+                    self._on_block(call, block)
+        except Exception as exc:  # noqa: BLE001 - one bad call must not stop the service
+            reason = f"error: {exc}"
+            if self._verbose:
+                print(f"[ws] connection failed: {exc!r}", file=sys.stderr)
+        finally:
+            if idle_task is not None:
+                idle_task.cancel()
+            if call is not None:
+                self._sockets.pop(call.call_id, None)
+                self._end_call(call, reason)
+
+    def _parse_control(self, message: str) -> dict:
+        try:
+            parsed = json.loads(message)
+            return parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            if self._verbose:
+                print(f"[ws] ignoring non-JSON text message: {message[:80]!r}", file=sys.stderr)
+            return {}
+
+    def _start_call(self, control: dict) -> _Call:
+        call_id = str(control.get("call_id") or f"call-{int(time.time()) & 0xFFFFFF:06x}")
+        rate = control.get("rate", WIRE_RATE)
+        if rate != WIRE_RATE:
+            # Everything downstream assumes the wire rate; a sender at another rate would
+            # transcribe as gibberish at the wrong speed, which is worth more than silence.
+            print(
+                f"[ws] WARNING call {call_id} announced {rate}Hz, expected {WIRE_RATE}Hz "
+                "-- audio will be misinterpreted; fix the sender",
+                file=sys.stderr,
+            )
+        print(f"[ws] call {call_id} started", file=sys.stderr)
+        return _Call(call_id, self._energy_threshold, self._hangover_ms)
+
+    def _on_block(self, call: _Call, block: np.ndarray) -> None:
+        if self._meter:
+            self._meter_block(block)
+            return
+        chunk = call.segmenter.process(block)
+        if chunk is not None:
+            self._queue.put((chunk, WIRE_RATE, time.perf_counter(), call.call_id))
+
+    def _meter_block(self, block: np.ndarray) -> None:
+        self._meter_window.append(float(np.sqrt(np.mean(np.square(block)))) if len(block) else 0.0)
+        if len(self._meter_window) < _METER_BLOCKS:
+            return
+        window = self._meter_window
+        loud = sum(1 for r in window if r >= self._energy_threshold)
+        print(
+            f"[meter] rms min={min(window):.4f} mean={sum(window) / len(window):.4f} "
+            f"max={max(window):.4f}  over-threshold {loud}/{len(window)} "
+            f"(threshold={self._energy_threshold})",
+            file=sys.stderr,
+        )
+        self._meter_window = []
+
+    async def _watch_idle(self, get_call: Callable[[], _Call | None]) -> None:
+        """Flush an utterance left open by a call that stalled without closing."""
+        if self._idle_timeout <= 0:
+            return
+        while True:
+            await asyncio.sleep(self._idle_timeout / 2)
+            call = get_call()
+            if call is None:
+                return
+            if time.monotonic() - call.last_audio >= self._idle_timeout:
+                tail = call.segmenter.flush()
+                if tail is not None and not self._meter:
+                    self._queue.put((tail, WIRE_RATE, time.perf_counter(), call.call_id))
+                call.last_audio = time.monotonic()  # don't re-flush every tick
+
+    def _end_call(self, call: _Call, reason: str) -> None:
+        """Close the call, flushing an utterance left open by hangup."""
+        self._meter_window = []
+        tail = call.segmenter.flush()
+        if tail is not None and not self._meter:
+            self._queue.put((tail, WIRE_RATE, time.perf_counter(), call.call_id))
+        print(f"[ws] call {call.call_id} ended ({reason}) {call.stats()}", file=sys.stderr)

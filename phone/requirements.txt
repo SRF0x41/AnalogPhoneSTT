@@ -1,0 +1,11 @@
+# The phone machine (Linux, 192.168.50.1) -- Asterisk and the HT801 are attached here.
+#
+# Deliberately tiny. Asterisk owns SIP, RTP, codecs and jitter; this package only moves
+# 20ms slin frames between an AudioSocket connection and a WebSocket, so it needs no SIP
+# stack, no audio library and no numpy. Nothing here processes samples -- it forwards bytes.
+
+# The link to the speech-to-text machine (stt_port).
+websockets==17.0.1
+
+# Asterisk ARI, for originating outbound calls to the HT801.
+requests==2.34.2

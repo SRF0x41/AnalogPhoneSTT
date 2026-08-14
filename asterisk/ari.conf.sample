@@ -1,0 +1,33 @@
+; ARI, used by `python -m phone --call` to ring the handset.
+;
+; Two files, both needing root, then `asterisk -rx "module reload res_ari.so"`.
+; ARI is disabled by default in Asterisk, and so is the HTTP server it rides on --
+; enabling one without the other is the usual reason origination fails with a
+; connection-refused rather than an error.
+
+; ------------------------------------------------------------------ /etc/asterisk/http.conf
+; [general]
+; enabled = yes
+; bindaddr = 127.0.0.1     ; localhost only: `phone` runs on this same machine, and there
+;                          ; is no reason to expose an authenticated control API to the LAN
+; bindport = 8088
+
+; ------------------------------------------------------------------- /etc/asterisk/ari.conf
+[general]
+enabled = yes
+pretty = no
+
+[analogphone]
+type = user
+read_only = no
+; Change this, and put the same value in ANALOGPHONE_ARI_PASSWORD (see phone/config.py).
+; It is a plaintext password in a config file: keep bindaddr on 127.0.0.1 above.
+password = CHANGE_ME
+password_format = plain
+
+; Verify without involving the phone at all:
+;
+;   curl -u analogphone:CHANGE_ME http://127.0.0.1:8088/ari/asterisk/info
+;
+; That should return JSON. If it refuses the connection, http.conf isn't enabled; if it
+; returns 401, the credentials don't match; if it 404s, res_ari.so isn't loaded.
