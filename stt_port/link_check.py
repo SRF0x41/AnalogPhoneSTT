@@ -104,8 +104,15 @@ def tcp_preflight(host: str, port: int, timeout: float) -> bool:
     try:
         sock.connect(sockaddr)
     except socket.timeout:
-        log(f"  TCP: no answer in {timeout:.0f}s -- FILTERED. Packets are being dropped,")
-        log("       which is a firewall on the far side, not a stopped server.")
+        log(f"  TCP: no answer in {timeout:.0f}s -- FILTERED. The packets are being dropped")
+        log("       rather than refused, so nothing on the far side ever saw them. Causes,")
+        log("       roughly in order of likelihood:")
+        log("         - the host is asleep (macOS answers ARP while sleeping, so it still")
+        log("           looks present to `ip neigh` -- check the screen, not the ARP table)")
+        log("         - a firewall dropping instead of rejecting")
+        log("         - this IP belongs to a different machine than you think")
+        log("       A host that is awake with no server on this port answers instantly with")
+        log("       a refusal instead, so 'not started' is NOT one of the causes here.")
         return False
     except ConnectionRefusedError:
         log(f"  TCP: refused in {(time.monotonic() - started) * 1000:.0f}ms -- REACHABLE but")
