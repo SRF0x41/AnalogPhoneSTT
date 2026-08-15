@@ -47,6 +47,7 @@ async def run(args: argparse.Namespace) -> None:
             stt_url=args.stt_url,
             sink=session.jsonl_transcript if args.jsonl else session.print_transcript,
             verbose=args.verbose,
+            responder=session.echo_responder if args.responder == "echo" else None,
         )
 
     server = await audiosocket.serve(handler, args.listen_host, args.listen_port)
@@ -95,6 +96,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--jsonl",
         action="store_true",
         help="print one JSON record per transcript instead of plain text",
+    )
+    p.add_argument(
+        "--responder",
+        choices=["none", "echo"],
+        default="none",
+        help="speak a reply back down the line: echo repeats what you said, which proves the "
+        "whole loop. Needs the stt machine started with --tts (default: none)",
     )
     p.add_argument("--verbose", action="store_true")
     return p

@@ -871,5 +871,195 @@ class TestNormaliseTranscript(unittest.TestCase):
         self.assertTrue(record["continues_previous"])
 
 
+class TestPcmConversion(unittest.TestCase):
+    """The float32 <-> PCM16 boundary, shared by the wav writer and the wire."""
+
+    def test_a_round_trip_preserves_the_waveform(self):
+        original = wave_f32(800)
+
+        restored = np.frombuffer(audio.float32_to_pcm16(original), dtype="<i2") / 32768.0
+
+        np.testing.assert_allclose(restored, original, atol=1e-4)
+
+    def test_out_of_range_samples_are_clipped_not_rescaled(self):
+        """A sample above 1.0 is a model bug; normalising would quietly relevel everything."""
+        loud = np.array([2.0, -2.0, 0.5], dtype=np.float32)
+
+        pcm = np.frombuffer(audio.float32_to_pcm16(loud), dtype="<i2")
+
+        self.assertEqual(pcm[0], 32767)
+        self.assertEqual(pcm[1], -32767)
+        self.assertAlmostEqual(pcm[2] / 32768.0, 0.5, places=3)
+
+    def test_it_is_little_endian_as_the_wire_requires(self):
+        pcm = audio.float32_to_pcm16(np.array([1.0], dtype=np.float32))
+
+        self.assertEqual(pcm, b"\xff\x7f")
+
+
+class TestResampleForTheWire(unittest.TestCase):
+    """Change of direction: the TTS path resamples *down*, 24kHz to the line's 8kHz."""
+
+    def test_tts_output_lands_at_the_wire_rate(self):
+        one_second = wave_f32(24000, rate=24000)
+
+        wire = audio.resample_to_target(one_second, 24000, server.WIRE_RATE)
+
+        self.assertAlmostEqual(len(wire) / server.WIRE_RATE, 1.0, delta=0.01)
+
+    def test_a_matching_rate_is_a_no_op(self):
+        x = wave_f32(800)
+
+        self.assertIs(audio.resample_to_target(x, 8000, 8000), x)
+
+    def test_the_default_target_is_still_the_asr_rate(self):
+        wire = wave_f32(8000)
+
+        self.assertAlmostEqual(len(audio.resample_to_target(wire, 8000)), 16000, delta=10)
+
+
+class StubTts:
+    """Stands in for Kokoro: no model, no GPU, no download."""
+
+    SAMPLE_RATE = 24000
+
+    def __init__(self, seconds: float = 1.0):
+        self.spoken: list[str] = []
+        self._seconds = seconds
+
+    def synthesize(self, text):
+        self.spoken.append(text)
+        return wave_f32(int(self.SAMPLE_RATE * self._seconds), rate=self.SAMPLE_RATE)
+
+
+class TestSpeakRequests(unittest.TestCase):
+    """A `SpeakRequest` rides the same queue as audio, and must not be mistaken for it."""
+
+    def _run(self, item, tts):
+        transcribed = []
+
+        class CountingBackend:
+            def transcribe(self, audio):
+                transcribed.append(audio)
+                return "should not have run"
+
+        q: queue.Queue = queue.Queue()
+        q.put(item)
+        q.put(None)
+        sent = []
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            main.consume_chunks(
+                CountingBackend(),
+                q,
+                consumer_args(),
+                sink=lambda cid, rec: None,
+                tts=tts,
+                speak_sink=lambda cid, pcm: sent.append((cid, pcm)),
+            )
+        return transcribed, sent, err.getvalue()
+
+    def test_speech_is_synthesized_and_sent_at_the_wire_rate(self):
+        tts = StubTts(seconds=1.0)
+
+        transcribed, sent, _err = self._run(server.SpeakRequest("call-1", "hello"), tts)
+
+        self.assertEqual(tts.spoken, ["hello"])
+        self.assertEqual(len(sent), 1)
+        call_id, pcm = sent[0]
+        self.assertEqual(call_id, "call-1")
+        # 1s at 8kHz, 2 bytes a sample -- i.e. resampled down from the model's 24kHz.
+        self.assertAlmostEqual(len(pcm) / 2 / server.WIRE_RATE, 1.0, delta=0.02)
+        self.assertEqual(transcribed, [], "a speak request must never reach the ASR model")
+
+    def test_the_duration_is_logged_so_the_echo_can_be_measured(self):
+        """Playback windows are what a self-transcription loop would be correlated against."""
+        _transcribed, _sent, err = self._run(server.SpeakRequest("call-1", "hello"), StubTts())
+
+        self.assertIn("[tts]", err)
+        self.assertIn("sent 1.00s", err)
+
+    def test_being_asked_to_speak_with_no_voice_loaded_is_logged_not_fatal(self):
+        transcribed, sent, err = self._run(server.SpeakRequest("call-1", "hello"), None)
+
+        self.assertEqual(sent, [])
+        self.assertEqual(transcribed, [])
+        self.assertIn("no voice is loaded", err)
+
+    def test_audio_chunks_still_transcribe_normally_afterwards(self):
+        """The two item types share a queue; neither may break the other."""
+        tts = StubTts()
+        q: queue.Queue = queue.Queue()
+        q.put(server.SpeakRequest("call-1", "reply"))
+        q.put((wave_f32(8000, rate=8000), 8000, 0.0, "call-1", False))
+        q.put(None)
+        seen = []
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            main.consume_chunks(
+                type("B", (), {"transcribe": lambda self, a: "real speech"})(),
+                q,
+                consumer_args(),
+                sink=lambda cid, rec: seen.append(rec),
+                tts=tts,
+                speak_sink=lambda cid, pcm: None,
+            )
+
+        self.assertEqual(tts.spoken, ["reply"])
+        self.assertEqual([r["text"] for r in seen if r], ["Real speech"])
+
+
+class TestSpeakControlMessage(ServerTestCase):
+    """`speak` arrives as JSON control and must reach the worker as a `SpeakRequest`."""
+
+    async def test_a_speak_message_is_queued_for_the_worker(self):
+        async with await self.connect() as ws:
+            await ws.send(json.dumps({"type": "call_start", "call_id": "speaker"}))
+            await ws.send(json.dumps({"type": "speak", "text": "say this"}))
+            await asyncio.sleep(0.2)
+
+        requests = [i for i in self.drain_queue() if isinstance(i, server.SpeakRequest)]
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].call_id, "speaker")
+        self.assertEqual(requests[0].text, "say this")
+
+    async def test_empty_text_is_ignored(self):
+        async with await self.connect() as ws:
+            await ws.send(json.dumps({"type": "call_start", "call_id": "speaker"}))
+            await ws.send(json.dumps({"type": "speak", "text": "   "}))
+            await asyncio.sleep(0.2)
+
+        self.assertEqual([i for i in self.drain_queue() if isinstance(i, server.SpeakRequest)], [])
+
+    async def test_speak_before_call_start_is_dropped_rather_than_crashing(self):
+        async with await self.connect() as ws:
+            await ws.send(json.dumps({"type": "speak", "text": "nobody to hear it"}))
+            await asyncio.sleep(0.2)
+
+        self.assertEqual(self.drain_queue(), [])
+
+
+class TestSendAudioBack(ServerTestCase):
+    async def test_synthesized_audio_reaches_the_right_call(self):
+        received = []
+
+        async with await self.connect() as ws:
+            await ws.send(json.dumps({"type": "call_start", "call_id": "listener"}))
+            await asyncio.sleep(0.1)
+
+            self.source.send_audio("listener", b"\x01\x02\x03\x04")
+            received.append(await asyncio.wait_for(ws.recv(), 2))
+
+        self.assertEqual(received, [b"\x01\x02\x03\x04"])
+
+    async def test_audio_for_an_unknown_call_is_dropped_silently(self):
+        async with await self.connect() as ws:
+            await ws.send(json.dumps({"type": "call_start", "call_id": "listener"}))
+            await asyncio.sleep(0.1)
+
+            self.source.send_audio("nobody", b"\x01\x02")  # must not raise
+            self.source.send_audio(None, b"\x01\x02")
+            self.source.send_audio("listener", b"")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,11 +21,15 @@ One WebSocket connection per call, opened by the phone machine.
   |---|---|---|
   | phone -> here | `call_start` | `call_id`, `rate`, `direction` |
   | phone -> here | `call_end`   | `reason` |
+  | phone -> here | `speak`      | `text` |
   | here -> phone | `transcript` | `call`, `text`, `dur_ms`, `latency_ms`, `continues_previous` |
   | here -> phone | `error`      | `message` |
 
-Binary in the here->phone direction is reserved for synthesized audio to play down the
-line; nothing sends it yet, and the phone side already knows how to write it to Asterisk.
+Binary here->phone is synthesized speech: PCM16, little-endian, mono, 8kHz -- the same format
+the caller's audio arrives in, so the phone side can hand it straight to Asterisk without
+touching a sample. That is why the models live on this side and the conversion happens here:
+the phone machine forwards bytes it never inspects, and needs neither numpy nor an audio
+library to play a voice down the line.
 
 ## Why this is so much smaller than the UDP receiver it replaces
 
@@ -48,11 +52,25 @@ import threading
 import time
 import uuid
 from queue import Queue
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 
 from .audio import HANGOVER_MS, TARGET_SAMPLE_RATE, Segmenter
+
+
+class SpeakRequest(NamedTuple):
+    """Text the phone machine wants spoken down the line.
+
+    Rides the *same* queue as closed utterances, and that is the whole design: one queue means
+    one worker, which means Whisper and the voice model can never be resident on the GPU at
+    the same moment. On an 8GB machine that is not an optimization, it is the thing that makes
+    running both models possible at all. It also keeps ordering honest -- a reply is
+    synthesized after the utterances that preceded it, not racing them.
+    """
+
+    call_id: str
+    text: str
 
 # The rate the phone machine sends at: the analog line's own rate, unresampled.
 WIRE_RATE = 8000
@@ -251,6 +269,35 @@ class WebSocketSource:
             self._pending[call_id] = self._pending.get(call_id, 0) + 1
         self._queue.put((chunk, WIRE_RATE, time.perf_counter(), call_id, final))
 
+    def _queue_speech(self, call: "_Call | None", text: str) -> None:
+        """Hand a `speak` request to the worker.
+
+        Deliberately *not* counted in `_pending`, unlike a chunk. That counter exists so a
+        hung-up call holds its socket open for the transcript it is still owed; a reply that
+        has not been synthesized when the caller hangs up is moot -- there is nobody on the
+        line to hear it -- and counting it would delay every teardown behind a synthesis
+        nobody wants.
+        """
+        if call is None or not text.strip():
+            return
+        self._queue.put(SpeakRequest(call.call_id, text))
+
+    def send_audio(self, call_id: str | None, pcm: bytes) -> None:
+        """Send synthesized speech back to be played. Called from `consume_chunks`' thread.
+
+        Thread-affine for the same reason as `emit`: websockets objects belong to the event
+        loop, so the send is scheduled onto it rather than performed here. A call whose socket
+        has already closed is not an error -- the caller hung up while we were talking.
+        """
+        websocket = self._sockets.get(call_id) if call_id is not None else None
+        if not pcm or websocket is None or self._loop is None:
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(websocket.send(pcm), self._loop)
+        except RuntimeError:
+            return  # loop already closed; shutting down
+        future.add_done_callback(self._log_send_failure)
+
     def _chunk_done(self, call_id: str | None) -> None:
         """One queued chunk has been transcribed. Runs on `consume_chunks`' thread."""
         if call_id is None:
@@ -313,6 +360,8 @@ class WebSocketSource:
                     elif kind == "call_end":
                         reason = str(control.get("reason", "hangup"))
                         break
+                    elif kind == "speak":
+                        self._queue_speech(call, str(control.get("text", "")))
                     continue
 
                 if call is None:

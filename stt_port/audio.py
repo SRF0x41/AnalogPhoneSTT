@@ -53,16 +53,34 @@ def default_input_device() -> tuple[int, float]:
     return idx, float(info["default_samplerate"])
 
 
-def resample_to_target(audio: np.ndarray, native_rate: int) -> np.ndarray:
-    if native_rate == TARGET_SAMPLE_RATE:
+def resample_to_target(
+    audio: np.ndarray, native_rate: int, target_rate: int = TARGET_SAMPLE_RATE
+) -> np.ndarray:
+    """Rate-convert mono float32. Defaults to the 16kHz the ASR backends want.
+
+    `target_rate` exists for the return path, which runs the conversion the other way: a TTS
+    model's 24kHz output down to the 8kHz the analog line carries.
+    """
+    if native_rate == target_rate:
         return audio
     from math import gcd
 
     from scipy.signal import resample_poly
 
-    g = gcd(native_rate, TARGET_SAMPLE_RATE)
-    up, down = TARGET_SAMPLE_RATE // g, native_rate // g
+    g = gcd(native_rate, target_rate)
+    up, down = target_rate // g, native_rate // g
     return resample_poly(audio, up, down).astype(np.float32)
+
+
+def float32_to_pcm16(audio: np.ndarray) -> bytes:
+    """Mono float32 in [-1, 1] -> the PCM16 little-endian bytes the wire and wav files use.
+
+    Clipped rather than scaled: a synthesized sample above 1.0 is a bug in the model, and
+    normalising the whole buffer to accommodate it would quietly change the level of
+    everything else.
+    """
+    clipped = np.clip(audio, -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
 
 
 def _frame_rms(x: np.ndarray, native_rate: int) -> tuple[np.ndarray, int]:

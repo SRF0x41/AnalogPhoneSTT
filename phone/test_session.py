@@ -81,6 +81,7 @@ class SessionTestCase(unittest.IsolatedAsyncioTestCase):
     stt_url_override: str | None = None
     final_transcript: str | None = None
     close_on_end: bool = True
+    responder: session.Responder | None = None
 
     async def asyncSetUp(self):
         self.stt = FakeStt(final_transcript=self.final_transcript, close_on_end=self.close_on_end)
@@ -97,6 +98,7 @@ class SessionTestCase(unittest.IsolatedAsyncioTestCase):
                 stt_url=self.stt_url_override or self.stt_url,
                 sink=self.transcripts.append,
                 verbose=True,
+                responder=type(self).responder,
             )
             self.finished.set()
 
@@ -126,6 +128,13 @@ class SessionTestCase(unittest.IsolatedAsyncioTestCase):
         self.writer.write(frame(audiosocket.KIND_HANGUP))
         await self.writer.drain()
         await asyncio.wait_for(self.finished.wait(), 5)
+
+    async def read_frame(self, timeout: float = 2.0) -> tuple[int, bytes]:
+        """Read one AudioSocket frame as Asterisk would -- i.e. what the caller hears."""
+        header = await asyncio.wait_for(self.reader.readexactly(3), timeout)
+        length = int.from_bytes(header[1:3], "big")
+        payload = await asyncio.wait_for(self.reader.readexactly(length), timeout) if length else b""
+        return header[0], payload
 
 
 class TestHappyPath(SessionTestCase):
@@ -333,6 +342,96 @@ class TestSinks(unittest.TestCase):
             session.print_transcript({"call": "abc", "text": "spoken words"})
 
         self.assertIn("spoken words", buf.getvalue())
+
+
+class TestSpeechReachesTheLine(SessionTestCase):
+    """Binary from the stt machine must end up in the caller's ear.
+
+    This is the direction that never existed: transcripts came back as text and the caller
+    heard nothing, so every live test was half a conversation. The bytes are already PCM16 at
+    the line's rate, so this side forwards them without looking.
+    """
+
+    async def test_binary_from_stt_is_played_down_the_line(self):
+        await self.send_audio(2)
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        # Two frames' worth of synthesized speech, as the stt machine would send it.
+        speech = bytes(range(256)) * 2 + bytes(128)
+        await self.stt._ws.send(speech)
+
+        kind, payload = await self.read_frame()
+        rest = b""
+        while len(payload) + len(rest) < len(speech):
+            _k, more = await self.read_frame()
+            rest += more
+
+        self.assertEqual(kind, audiosocket.KIND_AUDIO)
+        self.assertEqual(payload + rest, speech, "the audio must arrive intact and in order")
+        await self.hangup()
+
+    async def test_a_call_with_no_speech_back_is_unaffected(self):
+        await self.send_audio(2)
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.hangup()
+
+        self.assertEqual(self.transcripts, [])
+
+
+class TestResponder(SessionTestCase):
+    """The seam that decides what to say back. Ships as echo; an LLM attaches here later."""
+
+    responder = staticmethod(session.echo_responder)
+
+    async def test_a_transcript_produces_exactly_one_speak_request(self):
+        await self.send_audio(2)
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.stt.send_transcript(self.label, "hello there")
+
+        for _ in range(50):
+            speaks = [c for c in self.stt.control if c.get("type") == "speak"]
+            if speaks:
+                break
+            await asyncio.sleep(0.02)
+
+        self.assertEqual(len(speaks), 1, "one transcript, one reply")
+        self.assertIn("hello there", speaks[0]["text"])
+        await self.hangup()
+
+    async def test_the_transcript_still_reaches_the_sink(self):
+        """Speaking a reply must not consume the transcript the sink was going to print."""
+        await self.send_audio(2)
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.stt.send_transcript(self.label, "still printed")
+
+        for _ in range(50):
+            if self.transcripts:
+                break
+            await asyncio.sleep(0.02)
+
+        self.assertEqual([t["text"] for t in self.transcripts], ["still printed"])
+        await self.hangup()
+
+
+class TestResponderStaysSilent(SessionTestCase):
+    """No responder is the default, and silence must cost nothing."""
+
+    async def test_nothing_is_spoken_without_a_responder(self):
+        await self.send_audio(2)
+        await asyncio.wait_for(self.stt.connected.wait(), 2)
+        await self.stt.send_transcript(self.label, "hello there")
+        await asyncio.sleep(0.1)
+
+        self.assertEqual([c for c in self.stt.control if c.get("type") == "speak"], [])
+        await self.hangup()
+
+
+class TestEchoResponder(unittest.TestCase):
+    def test_an_empty_transcript_says_nothing(self):
+        self.assertIsNone(session.echo_responder({"text": "   "}))
+        self.assertIsNone(session.echo_responder({}))
+
+    def test_real_text_is_echoed(self):
+        self.assertIn("testing", session.echo_responder({"text": "testing"}))
 
 
 if __name__ == "__main__":

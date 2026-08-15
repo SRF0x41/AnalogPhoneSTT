@@ -32,6 +32,7 @@ from queue import Queue
 import numpy as np
 
 from . import audio, server
+from . import tts as tts_module
 from .backends import build_backend, default_backend, default_device
 from .server import DEFAULT_PORT
 
@@ -69,8 +70,12 @@ DEFAULT_MIN_SPEECH_FLOOR_MS = 130.0
 # B2, for the terminal hook click: the handset hitting its cradle, flushed by hangup. Every
 # measured call ended with one, transcribed as "Thank you.". It is louder and longer than the
 # shortest genuine one-word answer, so it is identified structurally rather than acoustically.
-# A caller still speaking at hangup produces far more than this.
-B2_MAX_SPEECH_SECONDS = 0.30
+#
+# 0.50, not the 0.30 originally fitted: a live call produced a hangup click measuring *exactly*
+# 0.30s, which escaped a `<` comparison by nothing at all. This threshold is cheap to widen
+# because it only ever applies to the one chunk hangup flushed -- a caller still speaking at
+# hangup measured 2.90s, so 0.50 keeps a ~6x margin where 0.30 had none.
+B2_MAX_SPEECH_SECONDS = 0.50
 
 # A2: the wall-clock ceiling on one decode, comfortably above the measured 1365ms p90.
 DEFAULT_INFERENCE_TIMEOUT = 4.0
@@ -78,13 +83,11 @@ DEFAULT_INFERENCE_TIMEOUT = 4.0
 
 def save_debug_wav(chunk: np.ndarray, native_rate: int) -> str:
     path = f"/tmp/dictate_{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.wav"
-    pcm16 = np.clip(chunk, -1.0, 1.0)
-    pcm16 = (pcm16 * 32767.0).astype(np.int16)
     with wave.open(path, "wb") as f:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(native_rate)
-        f.writeframes(pcm16.tobytes())
+        f.writeframes(audio.float32_to_pcm16(chunk))
     return path
 
 
@@ -319,7 +322,40 @@ def emit_transcript(text: str, target: np.ndarray, closed_at: float, call_id, ar
     return record
 
 
-def consume_chunks(backend, q: Queue, args: argparse.Namespace, sink=None) -> None:
+def speak(tts, request, speak_sink, args: argparse.Namespace) -> None:
+    """Synthesize one reply and hand it to the wire as 8kHz PCM16.
+
+    Runs on the worker thread, sharing it with transcription on purpose -- see
+    `server.SpeakRequest`. The conversion happens here rather than on the phone machine so
+    that side stays a byte forwarder with no numpy and no audio library.
+    """
+    if tts is None:
+        print(
+            f"[tts] call {request.call_id}: asked to speak but no voice is loaded "
+            "(start with --tts kokoro)",
+            file=sys.stderr,
+        )
+        return
+    t0 = time.perf_counter()
+    samples = tts.synthesize(request.text)
+    wire = audio.resample_to_target(samples, tts.SAMPLE_RATE, server.WIRE_RATE)
+    pcm = audio.float32_to_pcm16(wire)
+    seconds = len(wire) / server.WIRE_RATE
+    # Logged unconditionally, and with the duration, because this is what makes the echo
+    # measurable: it marks the window during which anything the segmenter opens is probably
+    # this machine hearing itself. See docs/ANALOG-TUNING.md on measuring before gating.
+    print(
+        f"[tts] call {request.call_id}: sent {seconds:.2f}s of audio "
+        f"(synth={(time.perf_counter() - t0) * 1000:.0f}ms) -- {request.text[:60]!r}",
+        file=sys.stderr,
+    )
+    if speak_sink is not None:
+        speak_sink(request.call_id, pcm)
+
+
+def consume_chunks(
+    backend, q: Queue, args: argparse.Namespace, sink=None, tts=None, speak_sink=None
+) -> None:
     """Transcribe and emit closed utterances until the source signals it is finished.
 
     Source-agnostic on purpose: the mic stream and WebSocketSource push the same tuples
@@ -348,6 +384,9 @@ def consume_chunks(backend, q: Queue, args: argparse.Namespace, sink=None) -> No
             item = q.get()
             if item is None:
                 return
+            if isinstance(item, server.SpeakRequest):
+                speak(tts, item, speak_sink, args)
+                continue
             chunk, chunk_native_rate, closed_at, call_id, final = item
             t_dequeued = time.perf_counter()
 
@@ -443,7 +482,7 @@ def run_listen_loop(backend, args: argparse.Namespace) -> None:
         consume_chunks(backend, q, args)
 
 
-async def _run_ws_loop(backend, args: argparse.Namespace) -> None:
+async def _run_ws_loop(backend, args: argparse.Namespace, tts=None) -> None:
     q: Queue = Queue()
     source = server.WebSocketSource(
         q,
@@ -472,12 +511,14 @@ async def _run_ws_loop(backend, args: argparse.Namespace) -> None:
         # Transcription blocks for as long as inference takes, so it runs on a worker
         # thread: the event loop has to stay free to keep draining audio off the socket
         # while the GPU works. `emit` hands transcripts back across that boundary.
-        await asyncio.to_thread(consume_chunks, backend, q, args, source.emit)
+        await asyncio.to_thread(
+            consume_chunks, backend, q, args, source.emit, tts, source.send_audio
+        )
 
 
-def run_ws_loop(backend, args: argparse.Namespace) -> None:
+def run_ws_loop(backend, args: argparse.Namespace, tts=None) -> None:
     """WebSocket source: serve the phone machine, then hand off to the shared consumer."""
-    asyncio.run(_run_ws_loop(backend, args))
+    asyncio.run(_run_ws_loop(backend, args, tts))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -568,6 +609,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "of turning 'five dozen' into '5 dozen'",
     )
 
+    v = p.add_argument_group(
+        "speaking back (--source ws)",
+        "Synthesize replies here and play them down the line. The phone machine sends a "
+        "`speak` message; the audio goes back as PCM16 on the same socket.",
+    )
+    v.add_argument(
+        "--tts",
+        choices=["none", "kokoro"],
+        default="none",
+        help="off by default, because the voice model is resident memory this machine may "
+        "not have to spare beside the ASR model (default: none)",
+    )
+    v.add_argument("--tts-model", default=None, help="override the voice model's HF repo")
+    v.add_argument(
+        "--tts-voice",
+        default=None,
+        help=f"voice name (kokoro default: {tts_module.KokoroBackend.DEFAULT_VOICE})",
+    )
+
     g = p.add_argument_group("phone source (--source ws)")
     g.add_argument(
         "--meter",
@@ -650,9 +710,24 @@ def main(argv: list[str] | None = None) -> None:
         run_benchmark(backend, args.benchmark)
         return
 
+    # Loaded after the ASR model, and only when asked: this is resident memory on a machine
+    # that may not have it to spare beside whisper-large-v3-turbo.
+    voice = None
+    if args.tts != "none" and not args.meter:
+        voice = tts_module.build_tts(args.tts, args.tts_model, args.tts_voice)
+        t0 = time.perf_counter()
+        voice.load()
+        t_load = time.perf_counter()
+        voice.warmup()
+        print(
+            f"[startup] tts={args.tts} model={voice.model_repo} voice={voice.voice} "
+            f"load={(t_load - t0) * 1000:.0f}ms warmup={(time.perf_counter() - t_load) * 1000:.0f}ms",
+            file=sys.stderr,
+        )
+
     try:
         if args.source == "ws":
-            run_ws_loop(backend, args)
+            run_ws_loop(backend, args, voice)
         else:
             run_listen_loop(backend, args)
     except KeyboardInterrupt:

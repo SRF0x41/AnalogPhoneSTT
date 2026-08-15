@@ -55,11 +55,28 @@ FLUSH_TIMEOUT_SECONDS = 2.0
 TEXT_SEND_TIMEOUT_SECONDS = 2.0
 
 TranscriptSink = Callable[[dict], Any]
+AudioSink = Callable[[bytes], Awaitable[None]]
+
+# What to say back, given a transcript record. Returning None says nothing, which is the
+# default: most utterances do not warrant a reply, and silence must be the easy case.
+Responder = Callable[[dict], str | None]
 
 
 def print_transcript(record: dict) -> None:
     """Default sink: one line per utterance on stdout."""
     print(f"[{time.strftime('%H:%M:%S')}] {record.get('text', '')}", flush=True)
+
+
+def echo_responder(record: dict) -> str | None:
+    """Say back what was heard.
+
+    Deliberately the dumbest possible responder. It proves the entire loop -- speech in,
+    transcript, synthesis, audio back down the line, a voice in the earpiece -- with no API
+    key, no network on the call path, and nothing to go wrong that isn't the loop itself.
+    Anything cleverer plugs into the same seam without touching a line of the plumbing.
+    """
+    text = (record.get("text") or "").strip()
+    return f"You said: {text}" if text else None
 
 
 def jsonl_transcript(record: dict) -> None:
@@ -84,6 +101,7 @@ class SttLink:
         self.frames_sent = 0
         self.frames_dropped = 0
         self.transcripts = 0
+        self.audio_frames = 0
 
     @property
     def connected(self) -> bool:
@@ -164,15 +182,35 @@ class SttLink:
         except Exception:  # noqa: BLE001 - timed out or the socket is gone; same outcome
             self._ws = None
 
-    async def receive_transcripts(self, sink: TranscriptSink) -> None:
-        """Feed the sink until the stt machine stops sending. Ends when the socket closes."""
+    async def speak(self, text: str) -> None:
+        """Ask the stt machine to say something down the line.
+
+        Text goes out, audio comes back on the same socket -- see `receive_transcripts`. The
+        models all live over there, so this end never sees a sample or loads anything.
+        """
+        if not text.strip():
+            return
+        await self._send_text({"type": "speak", "text": text})
+
+    async def receive_transcripts(
+        self, sink: TranscriptSink, on_audio: AudioSink | None = None
+    ) -> None:
+        """Feed the sink until the stt machine stops sending. Ends when the socket closes.
+
+        Two kinds of message come back. Text is a transcript for the sink; binary is
+        synthesized speech for `on_audio`, which `handle_call` wires to `Call.send` so it
+        plays in the caller's ear. This end forwards those bytes without inspecting them --
+        they are already PCM16 at the line's own rate, which is why this package still needs
+        no numpy and no audio library.
+        """
         if self._ws is None:
             return
         try:
             async for message in self._ws:
                 if not isinstance(message, str):
-                    # Reserved for synthesized speech to play down the line. Nothing sends
-                    # it yet; ignoring it keeps this forward-compatible rather than fatal.
+                    self.audio_frames += 1
+                    if on_audio is not None:
+                        await on_audio(message)
                     continue
                 try:
                     record = json.loads(message)
@@ -226,16 +264,32 @@ async def handle_call(
     sink: TranscriptSink = print_transcript,
     verbose: bool = False,
     on_dtmf: Callable[[str], Awaitable[None]] | None = None,
+    responder: Responder | None = None,
 ) -> None:
-    """Run one call end to end. Suitable as the handler passed to `audiosocket.serve`."""
+    """Run one call end to end. Suitable as the handler passed to `audiosocket.serve`.
+
+    With a `responder`, the call becomes two-way: each transcript is offered to it, and
+    anything it returns is spoken back into the caller's ear.
+    """
     call_id = call.label
     print(f"[session] call {call_id} connected", file=sys.stderr)
 
     link = SttLink(stt_url, call_id, verbose=verbose)
     await link.connect()
+
+    def on_transcript(record: dict) -> None:
+        sink(record)
+        if responder is None:
+            return
+        reply = responder(record)
+        if reply:
+            # Scheduled, not awaited: this runs inside the read loop, and blocking it on a
+            # send would stall the transcripts arriving behind this one.
+            asyncio.create_task(link.speak(reply))
+
     # Started even when the link is absent: it returns immediately, and keeping the shape
     # the same means the teardown path below has no special case.
-    reader = asyncio.create_task(link.receive_transcripts(sink))
+    reader = asyncio.create_task(link.receive_transcripts(on_transcript, call.send))
 
     reason = "hangup"
     try:
@@ -266,8 +320,9 @@ async def handle_call(
         finally:
             await link.close()
             dropped = f" dropped={link.frames_dropped}" if link.frames_dropped else ""
+            spoken = f" spoken={link.audio_frames}" if link.audio_frames else ""
             print(
                 f"[session] call {call_id} ended ({reason}) frames={call.frames_in} "
-                f"sent={link.frames_sent}{dropped} transcripts={link.transcripts}",
+                f"sent={link.frames_sent}{dropped} transcripts={link.transcripts}{spoken}",
                 file=sys.stderr,
             )
