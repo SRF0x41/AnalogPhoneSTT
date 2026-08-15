@@ -122,8 +122,23 @@ a measurement. Get it wrong in either direction and the symptom is silent failur
 
 | Threshold | Symptom |
 |---|---|
-| Too low | Every block reads as speech; no chunk ever closes until the 30s cap |
+| Too low | Line noise opens chunks that hold no speech; the model hallucinates text onto them, and long noise-only chunks stall the queue |
 | Too high | No chunk ever opens; nothing is ever transcribed |
+
+**What "too low" actually looked like on the first live call**, at the `0.01` default:
+**12 of 32 utterances were hallucinations** — `so`, `Thank you.`, and once `so Thank you.`
+— interleaved with correct transcripts of real speech. Whisper does not return empty for
+audio containing no speech; it returns the filler phrases it saw most often in training,
+and it returns them confidently.
+
+That has a cost beyond a messy transcript. Most utterances inferred in ~1.3s, but the
+noise-only ones ran to **10.8s**, because decode time scales with the number of 30s windows
+and a chunk opened by noise can stay open a long time. Each of those blocked the worker and
+backed up every real utterance behind it — queue waits went from ~0.1ms to nearly 5s. So a
+threshold below the noise floor shows up as *latency*, not just as garbage lines.
+
+Two symptoms, one cause. If transcripts are both cluttered and intermittently slow, this is
+the first thing to check, not the model or the network.
 
 `--meter` settles this in one call. It loads no model, transcribes nothing, and just prints
 rolling RMS to stderr:
@@ -257,23 +272,37 @@ the client. Also verified: MLX load, warmup and inference latency (the table abo
 that nothing in the network path needs `sounddevice`, `scipy` or any telephony dependency
 to import or run.
 
-**Not** verified, and needing hardware that isn't here:
+**Also verified, on the first live call** — real Asterisk, a real HT801, a real handset,
+150 seconds:
 
-- **No live call has ever been placed through this.** The phone machine's AudioSocket
-  server is tested against a synthetic Asterisk client, not against Asterisk.
-- **The two machines have never actually talked to each other.**
-- The `--energy-threshold` default for the phone source is still an educated guess awaiting
-  a real line. The simulated line used here had a noise floor around 0.002 RMS against
-  speech around 0.14, which the `0.01` default separates cleanly — but that floor was
-  chosen, not measured off an ATA.
-- Transcription *accuracy* on real human speech (as opposed to macOS `say` output) on a
-  real narrowband phone line — see the section above on why the small-model numbers prove
-  less than they appear to.
+- The two machines talk to each other. `blocks=7500 (150.0s)` — 7500 frames of 20ms is
+  exactly the call duration, so the wire lost nothing across two and a half minutes.
+- Real human speech over a real narrowband line transcribes accurately.
+- Inference held a median of 1.34s per utterance (min 1.28s), close to the 1.6s warmup, so
+  the model is not the bottleneck and the queue drains between utterances.
+- Hanging up mid-sentence still produced that final transcript, *after* `call_end` — the
+  drain path works against real hardware, not just `fake_call.py`.
+- Transcripts arrived back on the phone machine with zero send failures.
 
-The specific things to check on the first live call: `--meter` shows a clear gap between
+**Still not** verified:
+
+- Transcription accuracy measured against a known reference text. "It read correctly to
+  the person who said it" is not a WER — see the section above on why the small-model
+  numbers prove less than they appear to.
+- Anything about ARI call origination.
+- Whether any of this holds over a call long enough for thermal or memory pressure to
+  matter. 150 seconds is not an endurance test.
+
+The specific things to check on a first live call: `--meter` shows a clear gap between
 speech and quiet; a normal sentence prints within ~2s of the pause; hanging up mid-sentence
 still prints that last utterance; the transcript also appears on the phone machine; and
 both processes stay up, ready for the next call.
+
+**If the stt server prints its banner and then nothing at all** — no `[ws] call ... started`
+for a call the phone machine believes is up — the problem is below this layer, in the
+network path. Neither side logs anything useful in that state, which makes it look like an
+application bug when it isn't. [`docs/LINK-TROUBLESHOOTING.md`](../docs/LINK-TROUBLESHOOTING.md)
+covers how to tell, starting with `route -n get` on the phone machine's address.
 
 ## Deployment notes
 
@@ -284,6 +313,15 @@ both processes stay up, ready for the next call.
   restarts.** A refused connection is not fatal there: the call continues untranscribed
   rather than dropping. So "no transcripts" can mean this side isn't listening — check
   here before suspecting the line.
+- **"No transcripts" has a second cause that looks identical from the phone machine:
+  the connection never arrives at all.** Refused and timed out are logged the same way
+  there. Distinguish them from *this* side — if `lsof -nP -iTCP:9099` shows no connection
+  during a call the phone machine believes is up, nothing is reaching this host, and the
+  fault is in the network path rather than in either process. See
+  [`docs/LINK-TROUBLESHOOTING.md`](../docs/LINK-TROUBLESHOOTING.md).
+- **This server binds `0.0.0.0` by default**, so a connection failure is not a bind-address
+  problem unless `--listen-host` was set. Confirm with `lsof -nP -iTCP:9099 -sTCP:LISTEN`
+  before changing anything.
 - Audio arriving before `call_start` is adopted as a new call rather than discarded, which
   is what makes restarting this process mid-call recoverable.
 

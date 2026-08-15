@@ -130,6 +130,29 @@ the call continues untranscribed — someone is mid-sentence on the handset, and
 transcriber is not a reason to hang up on them. The audio pump keeps draining either way,
 because a socket nobody reads is a socket that backs up into Asterisk.
 
+**Diagnosing a call that transcribes nothing.** Tolerating every connection failure the same
+way is right for the caller and unhelpful for the operator: one line covers both "nothing is
+listening" and "nothing can get there."
+
+```
+[session] call <id>: no stt at ws://192.168.50.120:9099/ (<exc>) -- continuing untranscribed
+```
+
+The exception in the parentheses separates them, but the *timing* is easier to read, because
+`asyncio.TimeoutError` stringifies to nothing and prints as an empty `()`:
+
+| Timing | Exception | Meaning |
+|---|---|---|
+| Immediate | `ConnectionRefusedError` | Route is fine, host is rejecting. `stt_port` isn't running, or is on another port. |
+| ~2s stall (`CONNECT_TIMEOUT_SECONDS`) | a timeout, often blank | Packets are going nowhere. Routing, cable, or the far machine is down. |
+
+The second case is the one worth knowing about, because restarting `stt_port` will not fix
+it and everything on both machines looks healthy while it happens.
+[`docs/LINK-TROUBLESHOOTING.md`](../docs/LINK-TROUBLESHOOTING.md) covers it.
+
+If this line never appears at all, the connection succeeded — the fault is downstream, in
+segmentation or the model, not in the link.
+
 ## Testing
 
 ```sh

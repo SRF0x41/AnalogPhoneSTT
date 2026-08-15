@@ -63,6 +63,11 @@ protocol between two pyVoIP/Asterisk processes. It explains what that had to sol
 and why the current design doesn't have to solve it. Its reasoning about packet
 loss and silence detection still applies.
 
+[`docs/LINK-TROUBLESHOOTING.md`](docs/LINK-TROUBLESHOOTING.md) covers failures of
+the network path between the two machines — in particular the one where a wrong
+netmask on the stt machine makes the stt layer look dead while neither side logs
+anything at all.
+
 ## Getting started
 
 On the phone machine:
@@ -91,11 +96,26 @@ AudioSocket frame codec, the call lifecycle, the bridge, the WebSocket server, a
 segmentation at 8kHz — plus an end-to-end run of a synthetic Asterisk through both
 packages to a transcript arriving back on the phone machine.
 
-**Nothing has yet run against real Asterisk, a real HT801, or a real handset.**
-The verification above uses loopback sockets, a synthetic AudioSocket client, and
-a stub ASR backend. `python -m phone --echo` is the first thing to run on real
-hardware, because it proves the whole media path with neither the network nor the
-Mac involved.
+**The first live call has now run** — real Asterisk, a real HT801, a real handset,
+across both machines. A 150-second call carried `blocks=7500 (150.0s)`: 7500 frames
+of 20ms each, exactly the call duration, so nothing was lost on the wire. Speech
+transcribed accurately at a median 1.34s inference per utterance, transcripts
+arrived back on the phone machine, and the utterance interrupted by hanging up was
+still transcribed after `call_end` — the drain behaviour the design exists for.
+
+Two things that live hardware exposed, neither of them yet fixed:
+
+- **`--energy-threshold` is still uncalibrated**, and it matters more than the
+  offline tests could show: 12 of 32 utterances on that call were Whisper filler
+  (`so`, `Thank you.`) hallucinated onto segments that line noise had opened. See
+  [`stt_port/README.md`](stt_port/README.md).
+- **The link is fragile in a way that logs nothing.** A wrong netmask on the stt
+  machine silently misroutes the reply packets, and both machines then look
+  healthy while no audio moves. See
+  [`docs/LINK-TROUBLESHOOTING.md`](docs/LINK-TROUBLESHOOTING.md).
+
+Still unverified: transcription accuracy against a known reference text, and
+anything about call origination through ARI.
 
 Machine-specific notes (device passwords, service paths) belong in an untracked
 `local-notes.md`, not in this repo.
