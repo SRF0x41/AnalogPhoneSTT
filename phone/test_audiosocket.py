@@ -225,6 +225,48 @@ class TestSend(CallTestCase):
         self.assertEqual(await self.peer_r.readexactly(3), b"\x00\x00\x00")
         self.assertEqual(self.call.frames_out, 0)
 
+    async def test_playback_is_paced_in_real_time(self):
+        """Regression: a burst overran Asterisk's queue and the tail was dropped.
+
+        The whole buffer used to go down the socket at once. Asterisk does pace playback, but
+        only within a bounded queue, so a synthesized reply longer than that queue lost its
+        end -- the caller heard the voice "get quiet and drop off midway" while the log
+        reported every frame sent. Short replies fit, which disguised it as a fade.
+        """
+        loop = asyncio.get_running_loop()
+        half_a_second = b"\x00\x01" * (a.FRAME_SAMPLES * 25)  # 25 frames = 0.5s
+
+        t0 = loop.time()
+        await self.call.send(half_a_second)
+        elapsed = loop.time() - t0
+
+        self.assertEqual(self.call.frames_out, 25)
+        self.assertGreater(elapsed, 0.4, "25 frames must take about their own 0.5s to play")
+        self.assertLess(elapsed, 1.0, "but not drift far past it")
+
+    async def test_pacing_does_not_accumulate_drift(self):
+        """A deadline schedule, not sleep-per-frame: overhead must not compound."""
+        loop = asyncio.get_running_loop()
+
+        t0 = loop.time()
+        for _ in range(5):
+            await self.call.send(b"\x00\x01" * (a.FRAME_SAMPLES * 5))  # 5 frames, 100ms
+        elapsed = loop.time() - t0
+
+        self.assertEqual(self.call.frames_out, 25)
+        self.assertLess(elapsed, 0.75, f"0.5s of audio took {elapsed:.2f}s -- pacing is drifting")
+
+    async def test_an_idle_gap_resets_the_clock_so_echo_stays_immediate(self):
+        """`--echo` sends one frame per arriving frame; it must not inherit a stale deadline."""
+        await self.call.send(b"\x00\x01" * a.FRAME_SAMPLES)
+        await asyncio.sleep(0.1)  # longer than a frame: the schedule should have lapsed
+
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        await self.call.send(b"\x00\x01" * a.FRAME_SAMPLES)
+
+        self.assertLess(loop.time() - t0, 0.05, "a single frame after a gap should go at once")
+
 
 class TestServe(unittest.IsolatedAsyncioTestCase):
     async def test_handler_runs_per_connection_and_echoes(self):

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 import uuid
 from typing import AsyncIterator, Awaitable, Callable
 
@@ -49,6 +50,7 @@ HEADER_BYTES = struct.calcsize(HEADER_FORMAT)  # 3
 RATE = 8000          # slin, fixed by the dialplan application
 FRAME_SAMPLES = 160  # 20ms
 FRAME_BYTES = FRAME_SAMPLES * 2
+FRAME_SECONDS = FRAME_SAMPLES / RATE  # 0.02, the rate `send` paces playback at
 SLIN_BYTEORDER = "little"  # host order on x86; Asterisk does not swap
 
 # Asterisk sends a frame every 20ms. Silence still arrives as frames, so a real stall in
@@ -111,6 +113,8 @@ class Call:
         self.frames_in = 0
         self.frames_out = 0
         self._ended = False
+        # When the next outbound frame is due, on the monotonic clock. See `send`.
+        self._next_frame_at = 0.0
         self._pushback: bytes | Dtmf | None = None  # see ready()
         # Stands in for the UUID if Asterisk never sends one. Random rather than a fixed
         # placeholder because `label` identifies the call to the stt machine, which keys
@@ -217,18 +221,41 @@ class Call:
         return None
 
     async def send(self, pcm: bytes) -> None:
-        """Play PCM16 (8kHz, mono, little-endian) down the line.
+        """Play PCM16 (8kHz, mono, little-endian) down the line, paced in real time.
 
-        Asterisk paces playback itself, one frame per 20ms, so this returns as soon as the
-        bytes are handed to the socket. Oversized buffers are split into whole frames;
-        splitting mid-sample would turn the rest into noise, so the split is even.
+        Oversized buffers are split into whole frames; splitting mid-sample would turn the
+        rest into noise, so the split is even.
+
+        **Paced, one frame per 20ms, because Asterisk does not buffer a burst.** An earlier
+        version wrote every frame at once on the theory that Asterisk paces playback itself.
+        It does -- but only within a bounded queue, and a synthesized reply overruns it: a
+        5.5s sentence is 272 frames arriving instantly, and the caller heard the audio "get
+        quiet and drop off midway" while the log happily reported all of it sent. Short
+        replies fit the buffer and survived, which is what made the failure look like a
+        fade-out rather than a truncation.
+
+        So this returns only once the audio has actually been played out, which also
+        serializes overlapping replies for free -- the next one cannot start mid-sentence.
+
+        The schedule is a monotonic deadline rather than `sleep(0.02)` per frame, so the
+        per-iteration overhead does not accumulate into drift over a long utterance. A gap
+        since the last send resets it, which keeps `--echo` (one frame in, one frame out)
+        exactly as immediate as it was.
         """
         if self._ended:
             return
+        deadline = max(self._next_frame_at, time.monotonic())
         for start in range(0, len(pcm), FRAME_BYTES):
+            delay = deadline - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._ended:  # hung up mid-playback; stop talking to a closed socket
+                return
             self._writer.write(pack(KIND_AUDIO, pcm[start : start + FRAME_BYTES]))
             self.frames_out += 1
-        await self._drain()
+            deadline += FRAME_SECONDS
+            await self._drain()
+        self._next_frame_at = deadline
 
     async def hangup(self) -> None:
         """Ask Asterisk to end the call."""

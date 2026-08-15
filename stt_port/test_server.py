@@ -978,6 +978,50 @@ class TestSpeakRequests(unittest.TestCase):
         self.assertIn("[tts]", err)
         self.assertIn("sent 1.00s", err)
 
+    def test_a_voice_that_raises_does_not_kill_the_service(self):
+        """Regression: a word the voice could not phonemize took the whole server down.
+
+        misaki raises `TypeError: NoneType + str` on an out-of-dictionary word when espeak-ng
+        is absent, and because synthesis shares the worker thread with transcription, the
+        uncaught exception ended the process mid-call -- losing the STT service too. The word
+        that found it was "Claude".
+        """
+
+        class BrokenTts:
+            SAMPLE_RATE = 24000
+
+            def synthesize(self, text):
+                raise TypeError("unsupported operand type(s) for +: 'NoneType' and 'str'")
+
+        transcribed, sent, err = self._run(server.SpeakRequest("call-1", "Claude"), BrokenTts())
+
+        self.assertEqual(sent, [], "nothing to play, but the worker survives")
+        self.assertIn("could not synthesize", err)
+
+    def test_the_worker_keeps_going_after_a_synthesis_failure(self):
+        class BrokenTts:
+            SAMPLE_RATE = 24000
+
+            def synthesize(self, text):
+                raise RuntimeError("boom")
+
+        q: queue.Queue = queue.Queue()
+        q.put(server.SpeakRequest("call-1", "unsayable"))
+        q.put((wave_f32(8000, rate=8000), 8000, 0.0, "call-1", False))
+        q.put(None)
+        seen = []
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            main.consume_chunks(
+                type("B", (), {"transcribe": lambda self, a: "still transcribing"})(),
+                q,
+                consumer_args(),
+                sink=lambda cid, rec: seen.append(rec),
+                tts=BrokenTts(),
+                speak_sink=lambda cid, pcm: None,
+            )
+
+        self.assertEqual([r["text"] for r in seen if r], ["Still transcribing"])
+
     def test_being_asked_to_speak_with_no_voice_loaded_is_logged_not_fatal(self):
         transcribed, sent, err = self._run(server.SpeakRequest("call-1", "hello"), None)
 

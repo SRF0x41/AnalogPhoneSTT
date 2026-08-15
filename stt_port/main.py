@@ -337,7 +337,21 @@ def speak(tts, request, speak_sink, args: argparse.Namespace) -> None:
         )
         return
     t0 = time.perf_counter()
-    samples = tts.synthesize(request.text)
+    try:
+        samples = tts.synthesize(request.text)
+    except Exception as exc:  # noqa: BLE001 - see below; this must never reach the worker loop
+        # A voice that cannot say one particular sentence is a bad reply, not a dead service.
+        # This is not hypothetical: misaki raises `TypeError: NoneType + str` on a word it
+        # cannot phonemize when espeak-ng is absent, and the word that found it was "Claude".
+        # Unhandled, that killed the whole STT server mid-call -- transcription and all --
+        # because synthesis shares the worker thread. The same reasoning as `_handle`'s
+        # catch-all in server.py: one bad input must not stop the service.
+        print(
+            f"[tts] call {request.call_id}: could not synthesize {request.text[:60]!r} "
+            f"({type(exc).__name__}: {exc}) -- saying nothing",
+            file=sys.stderr,
+        )
+        return
     wire = audio.resample_to_target(samples, tts.SAMPLE_RATE, server.WIRE_RATE)
     pcm = audio.float32_to_pcm16(wire)
     seconds = len(wire) / server.WIRE_RATE
