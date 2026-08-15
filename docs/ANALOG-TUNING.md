@@ -8,9 +8,15 @@ with `--debug-save-wav`, kept in `samples/`, and paired against the server's tim
 Later calls were scripted against known reference text so accuracy could be scored rather
 than eyeballed.
 
-Two claims in earlier drafts were falsified by later measurements and are marked where they
+Four claims in earlier drafts were falsified by later measurements and are marked where they
 appear, rather than quietly removed — the corrections are the most useful part of the
-document, because both wrong answers were the intuitive ones.
+document, because every wrong answer was the intuitive one. The third was found during
+implementation, by replaying the clip set against the code rather than against the prose. The
+fourth was found by a live call *after* the code shipped, and could not have been found any
+other way: it was an assumption about how quickly someone hangs up.
+
+**Changes A–D are implemented.** See "Implementation status" at the end for what each one
+measured afterwards.
 
 ## The headline: the audio is not the problem
 
@@ -82,6 +88,19 @@ not counted as an error:
 times it appeared — a deterministic lexical failure, not acoustic noise, and it inflates the
 count because one word becomes two tokens. Excluding that word, the scored passages are
 **0% WER**.
+
+> **Correction: "deterministic" was too strong.** On a later call the sentence *"Claude, the
+> northern depot has fifteen or fifty crates, and Sarah can't tell which"* came back verbatim,
+> `depot` included. The same word, the same line, the same model. What changed was the
+> surrounding context: both failures put `depot` in a short phrase (`the northern depot`),
+> while the success embedded it in a long sentence with strong lexical neighbours.
+>
+> So it is context-dependent, not deterministic — which puts it in the same category as
+> everything else on this line. `Claude` behaves identically: standalone it came back as
+> `Quad`, and in the middle of that sentence it was correct. **Context is the mechanism that
+> rescues narrowband audio**, and the practical advice in the minimal-pair section — keep
+> meaning inside sentences, never in isolated tokens — is if anything better supported than
+> when it was written.
 
 The teen/ty result is the surprise: `fifteen` vs `fifty` is the canonical narrowband failure
 and this line handles it perfectly. The weakness is elsewhere and it is consistent —
@@ -291,10 +310,33 @@ here rather than quietly dropped: the clean rule came from n=4 and did not survi
 Two layers, each aimed at the source it can actually catch:
 
 **B1 — an energy-and-duration gate, for the near-silence source.** Discard a chunk before
-inference when `speech duration < 0.25s AND mean RMS < 0.01`. Both conditions, not either:
+inference when `speech duration < 0.25s AND mean RMS < 0.025`. Both conditions, not either:
 the conjunction is what stops it swallowing a genuine short answer, since real speech at
-0.24s measured 0.05–0.12 RMS, an order of magnitude clear. This catches the 0.02–0.06s
-clips cleanly and provably cannot touch anything as loud as real speech.
+0.24s measured 0.05–0.12 RMS, an order of magnitude clear.
+
+> **Correction — the third falsified claim, and the most embarrassing one.** This rule
+> originally read `mean RMS < 0.01`, and it **cannot fire**. Mean RMS is defined below as the
+> mean over frames *already above 0.01*, so it is either exactly 0.0 or strictly greater than
+> 0.01 — never in between. Replaying all 78 clips against the implementation suppressed **0 of
+> 10** filler utterances, not the 4 of 7 predicted. The threshold was read off the wrong
+> column: the `0.004–0.006` in the sources table above is whole-clip RMS, while the
+> `0.078–0.167` in the safety-margin table below is the speech-frame mean. They are different
+> metrics and the plan mixed them.
+>
+> Re-fitted against the real numbers, the quiet filler measures **0.0102–0.0163** speech-frame
+> RMS, so the gate is now **0.025** — clear of the filler and far below the 0.078 floor of real
+> one-word answers.
+>
+> **And the safety claim was wrong too.** "Provably cannot touch anything as loud as real
+> speech" is false: the genuine 0.02s exclamation noted below measures 0.0144 speech-frame RMS
+> and **0.0038 whole-clip RMS — quieter than every single filler clip** on that axis, and
+> inside their range on the other. It is not separable from filler at any threshold on these
+> two axes. The gate takes it. That is a deliberate trade — six hallucinations removed for one
+> short exclamation lost — not an oversight, and it is why every suppression is logged.
+>
+> The lesson repeats the one in the paragraph above: a threshold is meaningless without the
+> metric that produced it, and the metric has to be the one the code actually computes.
+> `stt_port/replay.py` exists so the next threshold is checked against the clips, not the prose.
 
 **B2 — suppress the terminal hook click, which is structurally identifiable.** The loud
 short filler is not random: **all five calls ended with `Thank you.` as their final
@@ -317,10 +359,50 @@ call, at the moment the line is being torn down), it is safe (a caller mid-sente
 hangup produces far more than 0.3s — call 1's final real utterance was a full sentence), and
 it removes the single most reliable source of filler in the system.
 
+> **Correction — the fourth falsified claim, found by a live call after B2 shipped.** B2 is
+> right but **not sufficient**, and the reason is timing nobody had varied. It identifies the
+> click as *the chunk hangup flushed*, which only holds when `call_end` arrives inside the
+> 500ms hangover. All five calls measured above hung up promptly. Hang up two seconds before
+> the socket closes — a slow hand on the cradle — and the click closes on silence like any
+> ordinary chunk, arrives with `final=False`, and comes back as `Thank you.` regardless.
+>
+> Two live calls did exactly that, and the second defeated the first attempted fix:
+>
+> | click | speech | mean RMS | longest unbroken run | caught by |
+> |---|---|---|---|---|
+> | call at 12:35 | 0.06s | 0.2372 | 0.06s | a total-duration floor |
+> | call at 12:39 | **0.20s** | 0.1225 | **0.12s** | only a *continuity* floor |
+>
+> The second is the instructive one. 0.20s of speech is too much for a duration floor (the
+> shortest real utterance is 0.24s) and 0.1225 RMS is five times too loud for B1's energy
+> half. But its loud frames sat at positions 15–16, 26–27 and 51–56 of 81 — **three isolated
+> taps across 1.64s**, a handset resting, shifting, then seating. It is not one sound.
+>
+> That is the axis where a settling handset and a short word genuinely differ, and it is the
+> one this document never measured: **a word is continuous.** Across all 78 clips and five
+> live calls, clicks run 0.02–0.12s unbroken and real utterances 0.14s or longer. The floor is
+> `--min-speech-floor-ms`, default **130**, and it consults energy not at all.
+>
+> The margin is thin where the corpus is thinnest: 0.13s sits 10ms above the shortest real run
+> in the clip set (the word `fourteen`) and 10ms below the longest click. Live calls put real
+> utterances at 0.20s and up, so the practical margin is wider — but this is the **first number
+> to re-measure on different hardware**, ahead of the energy thresholds.
+>
+> The general lesson is the same one as the `0.01` threshold above, one level up: a structural
+> rule is only as good as the invariant it rests on, and "hangup flushes the click" was an
+> invariant of *how fast the tester hung up*.
+
 Prefer this to a filler-phrase denylist. A denylist was the earlier proposal here, justified
 by 100% of filler being the exact string `Thank you.`; it is still available as a backstop,
 applied only to utterances under ~1s so a genuine "thank you" is never touched. But matching
 on structure beats matching on strings when the structure is this clean.
+
+> **The denylist turned out to be unnecessary.** At its re-fitted 0.025 threshold B1 catches
+> **both** mid-sentence-pause hallucinations — they measure 0.0117 and 0.0163 speech-frame RMS,
+> quiet enough to gate — which the "residual case" argument above assumed only a denylist could
+> reach. Measured over the whole clip set, B1 and B2 together suppress **10 of 10** filler
+> utterances with no phrase matching at all. Nothing in this system inspects the text of a
+> transcript to decide whether to keep it, and it should stay that way.
 
 Both layers should **log what they suppress rather than silently dropping it**. A caller who
 really does say nothing but "thank you" and sees it vanish has no way to tell the difference
@@ -361,6 +443,11 @@ a single condition.
 
 Expected effect over all four calls: B1 removes 4 of 7 filler utterances with no false
 positives; B2 removes the remaining 3. Neither touches any of the 60 real utterances.
+
+> **Measured, over all five calls and all 78 clips** (`python -m stt_port.replay`): B1 removes
+> **6 of 10** filler utterances and one real one; B2 removes the remaining **4**. 67 of 68 real
+> utterances are untouched. Better than predicted on filler, and not free, as the correction
+> above explains.
 
 ### C. Trim trailing silence before inference — *moderate, and not for the reason it appears*
 
@@ -462,6 +549,11 @@ holding the handset.
 A–D together should be well under a hundred lines. The captured clips in `/tmp/dictate_*.wav`
 plus `--benchmark` make each one verifiable offline against the exact audio that provoked
 the defect, with no phone call required.
+
+> The line estimate was optimistic: A–D came to ~350 added lines across four modules, roughly
+> half of it comment and docstring. The logic really is small — `filler_reason` is eight lines
+> — but four CLI flags, a watchdog class, a numeral converter and the reasoning behind each
+> threshold are not. The offline-verification claim held exactly as written.
 
 **Do not implement B without keeping the captured clips.** Its thresholds are calibrated to a
 sample of 43 utterances, one of which already falsified an earlier version of the rule. The
@@ -566,6 +658,18 @@ This is the regression set the plan is calibrated against. Verify changes by rep
 through the backend and diffing against the `transcript` column — the filler rows are the
 ones that should change and nothing else should.
 
+`stt_port/replay.py` does exactly that:
+
+```sh
+./.venv/bin/python -m stt_port.replay              # gates only, no model, instant
+./.venv/bin/python -m stt_port.replay --transcribe # also decode, and diff every transcript
+./.venv/bin/python -m stt_port.replay --clip 001834_596 --transcribe   # one clip
+```
+
+It takes the same `--min-speech-ms` / `--min-speech-rms` flags as the server, so a threshold
+can be re-fitted against the clips in seconds. Any real utterance appearing in its suppressed
+list other than the known 0.02s exclamation is a regression.
+
 Ground truth for the scored passages lives in the accuracy tables above; the reference text
 was read deliberately for that purpose and is not recoverable from the clips alone.
 
@@ -575,10 +679,10 @@ Run from the repo root, as module paths. `unittest discover` does **not** work h
 fails on import, because the tests import their package:
 
 ```sh
-# this side only — 24 tests
+# this side only — 59 tests (24 before this work)
 .venv/bin/python -m unittest stt_port.test_server
 
-# both packages — 62 tests, all passing as of 2026-08-15
+# both packages — 97 tests, all passing as of 2026-08-15 (62 before this work)
 .venv/bin/python -m unittest stt_port.test_server phone.test_audiosocket phone.test_session
 ```
 
@@ -587,6 +691,91 @@ behaviour that the hazard above concerns. But note the limit: a B1 implementatio
 in the wrong place will most likely **still pass all 62 tests** and fail on a live call, since
 the drain path only misbehaves when a real socket is waiting on it. Green tests are not
 sufficient evidence for that change — replay the clips, and make a real call.
+
+The 35 tests added with A–D cover the gates at their measured boundaries, the watchdog, the
+trimming and the normaliser — and, specifically, that a gated chunk still reaches the sink
+(`TestGatedChunksStillReachTheSink`). That last one is the hazard above written down as an
+assertion, but it is still a stub sink rather than a socket: **it remains true that only a
+real call proves this.**
+
+## Implementation status
+
+A–D are implemented; E and F are not, deliberately.
+
+| Change | Where it landed | Measured afterwards |
+|---|---|---|
+| **A1** ladder | `TEMPERATURE_LADDER` in `stt_port/backends.py`, passed to both Whisper backends | with C, the pathological clip decodes in **1291ms**, down from 22433ms |
+| **A2** watchdog | `InferenceWatchdog` in `stt_port/main.py`, `--inference-timeout` (default 4s) | no clip in the set exceeds the ceiling; worst decode is 1462ms |
+| **B1** energy gate | `filler_reason`, `--min-speech-ms` / `--min-speech-rms` | 6 of 10 filler suppressed, 1 real utterance lost |
+| **B2** hangup click | `final` flag on the queue tuple, set by `_end_call` in `server.py` | 4 of 4 terminal clicks suppressed, no false positives — but see the correction: insufficient on its own |
+| **B3** continuity floor | `--min-speech-floor-ms` (130), added after B2 was defeated live | catches every click that closes on silence before hangup |
+| **C** trim tails | `audio.trim_trailing_silence`, applied before resampling | normal decodes unchanged (~1.3s), as predicted |
+| **D** normalisation | `normalise_transcript`, applied in `emit_transcript`; `--numerals` | casing and trailing commas consistent; numeral conversion opt-in |
+| **E** hangover | not implemented — still depends on what consumes the transcripts | — |
+| **F** high-pass | not implemented — nothing measured here indicates it | — |
+
+Two decisions worth recording, because neither is what the plan above proposed:
+
+**A2 cannot do what this document claimed it would.** "Abandon that utterance and log it rather
+than let it hold the worker" is not achievable in-process: a decode already running cannot be
+cancelled, so the abandoned one keeps the GPU and the next one queues behind it. What the
+ceiling actually guarantees is that the *pipeline* stops waiting — the garbage never reaches
+the transcript, the hangup drain path is never held by an unbounded decode, and an overrun
+appears in the log instead of as a system that has silently died. **A1 and C are what bound the
+wall time.** A true hard bound needs the model in a separate process that can be killed, which
+costs a full model reload on every kill; not worth it while A1 and C hold.
+
+**D returns the continuation hint rather than destroying it.** Capitalising every utterance
+would erase the lowercase leading word that defect 4 identifies as the reassembly signal, so
+`normalise_transcript` returns it separately and it rides along as `continues_previous` on the
+record and on the wire. Whatever eventually implements E's downstream stitching gets the signal
+for free.
+
+**Numeral conversion is off by default** (`--numerals asis`). It is right for a parser and wrong
+for a reader — it renders `five dozen liquor jugs` as `5 dozen liquor jugs` — and since E is
+already blocked on knowing what consumes the transcripts, so is this.
+
+### Verified on live hardware, 2026-08-15
+
+Four calls through a real HT801 after A–D shipped, reading a fixed script. The first call went
+to a stale server still running the old code, which turned into a matched before/after on
+identical text.
+
+| Check | Before | After |
+|---|---|---|
+| Six one-word answers | all transcribed | all transcribed, **none gated** — B1's false-positive risk did not materialise |
+| Mid-sentence pause | `Thank you.` hallucinated into it | `[gate] near-silence`, nothing printed |
+| Sentence read straight through | one utterance | one utterance |
+| `fifty` / `fifteen` | `50 or 15` | `50 or 15` — no regression |
+| Invoice line | full, with `4729`/`613`/`Sarah Fitzgerald` | same |
+| Hangup mid-sentence (×2) | — | tail transcribed, socket closed immediately, gate silent |
+| Terminal `Thank you.` | on **every** call ever recorded | **gone** |
+
+The last row took three attempts and is the origin of the fourth correction above. The final
+confirming call ended like this — three real answers, three suppressed fragments of one
+deliberately clumsy hangup, and nothing after the call ended:
+
+```
+[12:45:01] Yes.
+[12:45:04] No.
+[12:45:07] Eight.
+[gate] dropped chunk before inference -- no continuous speech (longest run 0.02s < 130ms, at any volume)
+[gate] dropped chunk before inference -- no continuous speech (longest run 0.08s < 130ms, at any volume)
+[gate] dropped chunk before inference -- no continuous speech (longest run 0.12s < 130ms, at any volume)
+[ws] call 8d803f90 ended (hangup) blocks=777 (15.5s)
+```
+
+Across all 38 clips captured on those calls: 8 dropped, every one of them filler or a hangup
+fragment, and all 30 real utterances kept.
+
+### What the clip set says now
+
+`python -m stt_port.replay --transcribe` re-decodes every clip the gates keep and diffs against
+the manifest. 17 of 67 transcripts changed; **none lost content**. The changes are the same
+punctuation and numeral drift defect 3 describes (`six` → `Six.`, `13` → `13.`), one
+improvement (`baltimore` → `Baltimore.`), and the headline fix (`8 check check check…` → `8`).
+The manifest is deliberately *not* regenerated: it records what provoked each defect, and
+overwriting it would erase the evidence these thresholds were fitted to.
 
 ## Reproducing the measurements
 

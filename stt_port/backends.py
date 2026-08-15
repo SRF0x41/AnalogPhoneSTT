@@ -25,6 +25,19 @@ import numpy as np
 os.environ.setdefault("WANDB_MODE", "disabled")
 os.environ.setdefault("WANDB_DISABLED", "true")
 
+# Whisper's temperature-fallback ladder, shortened from the default six rungs.
+#
+# `compression_ratio_threshold` detects a repetition loop in a decode and retries at the next
+# temperature up. On a measured live call one 1.16s clip of the word "eight" looped at *every*
+# rung, paid the full ladder, and returned the garbage anyway: 22.4 seconds of inference for
+# 1.16 seconds of audio, 35.6% of all inference time in that call. The damage was not the bad
+# line but the backlog behind it -- the next twenty utterances transcribed correctly and
+# arrived up to 22 seconds late, which on a live call is indistinguishable from a dead system.
+#
+# The guard fires but cannot win, so what matters is bounding what it costs to lose. A retry
+# that has failed three times is not going to succeed on the sixth.
+TEMPERATURE_LADDER = (0.0, 0.2, 0.4)
+
 
 class Backend(Protocol):
     def load(self) -> None: ...
@@ -109,7 +122,9 @@ class WhisperBackend:
         self.transcribe(np.zeros(16000, dtype=np.float32))
 
     def transcribe(self, audio: np.ndarray) -> str:
-        segments, _info = self._model.transcribe(audio, language="en", vad_filter=False)
+        segments, _info = self._model.transcribe(
+            audio, language="en", vad_filter=False, temperature=TEMPERATURE_LADDER
+        )
         return " ".join(seg.text.strip() for seg in segments).strip()
 
 
@@ -150,6 +165,7 @@ class MLXWhisperBackend:
             # Each utterance is an independent segment closed by silence, so conditioning on
             # the previous one only invites the model to run away with a hallucinated context.
             condition_on_previous_text=False,
+            temperature=TEMPERATURE_LADDER,
         )
         return result["text"].strip()
 

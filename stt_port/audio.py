@@ -15,6 +15,7 @@ from __future__ import annotations
 import sys
 import time
 from queue import Queue
+from typing import NamedTuple
 
 import numpy as np
 
@@ -24,6 +25,16 @@ PREROLL_MS = 300
 HANGOVER_MS = 500
 MAX_CHUNK_SECONDS = 30
 DEFAULT_ENERGY_THRESHOLD = 0.02
+
+# The frame floor `speech_stats` measures against, deliberately *not* `energy_threshold`.
+# Segmentation decides whether an utterance opens; this decides how much of an already-open
+# utterance counts as speech, and every threshold in docs/ANALOG-TUNING.md -- including the
+# `speech_s`/`speech_rms` columns of samples/MANIFEST.csv -- was measured at this value.
+# Tuning --energy-threshold for a different line must not silently move them.
+SPEECH_FRAME_FLOOR = 0.01
+
+# The analysis hop those same measurements used: 20ms, independent of sample rate.
+SPEECH_FRAME_MS = 20
 
 
 def list_devices() -> None:
@@ -52,6 +63,91 @@ def resample_to_target(audio: np.ndarray, native_rate: int) -> np.ndarray:
     g = gcd(native_rate, TARGET_SAMPLE_RATE)
     up, down = TARGET_SAMPLE_RATE // g, native_rate // g
     return resample_poly(audio, up, down).astype(np.float32)
+
+
+def _frame_rms(x: np.ndarray, native_rate: int) -> tuple[np.ndarray, int]:
+    """Per-frame RMS over non-overlapping `SPEECH_FRAME_MS` frames, plus the frame size.
+
+    Deliberately drops the final partial frame, matching the measurement script that produced
+    the numbers in docs/ANALOG-TUNING.md: a different framing moves every threshold with it.
+    """
+    hop = max(1, native_rate * SPEECH_FRAME_MS // 1000)
+    frames = max(0, -(-(len(x) - hop) // hop))
+    if frames <= 0:
+        return np.zeros(0, dtype=np.float32), hop
+    windows = x[: frames * hop].reshape(frames, hop)
+    return np.sqrt(np.square(windows, dtype=np.float64).mean(axis=1)), hop
+
+
+class SpeechProfile(NamedTuple):
+    """The three axes the filler gates in `main.filler_reason` are calibrated against."""
+
+    speech_s: float
+    """Total duration of frames above `SPEECH_FRAME_FLOOR`."""
+
+    mean_rms: float
+    """Mean RMS over *those frames only*, not the whole clip.
+
+    Consequence of that definition: either exactly 0.0 (nothing cleared the floor) or
+    strictly above `SPEECH_FRAME_FLOOR`. A threshold at or below the floor can therefore only
+    fire on silence -- exactly the mistake the first version of change B1 made.
+    """
+
+    longest_run_s: float
+    """Longest *contiguous* run of those frames.
+
+    The one that separates a settling handset from a short word, which neither of the others
+    can. A word is continuous; a handset finding its cradle is two or three isolated taps
+    spread over a second or more. A live call produced 0.20s of speech at 0.1225 RMS -- too
+    long for a duration floor, far too loud for an energy gate -- whose loud frames sat at
+    positions 15-16, 26-27 and 51-56 of 81. Its longest run was 0.12s. Measured across all 78
+    captured clips plus five live calls, every click runs 0.02-0.12s and every real utterance
+    runs 0.14s or longer.
+    """
+
+
+def speech_profile(x: np.ndarray, native_rate: int) -> SpeechProfile:
+    """Measure a chunk on the three axes the filler gates use."""
+    voiced, hop = _frame_rms(x, native_rate)
+    loud = voiced > SPEECH_FRAME_FLOOR
+    if not loud.any():
+        return SpeechProfile(0.0, 0.0, 0.0)
+    frame_s = hop / native_rate
+    # Longest run of Trues: the cumulative count since the last False, maxed.
+    best = run = 0
+    for is_loud in loud:
+        run = run + 1 if is_loud else 0
+        best = max(best, run)
+    return SpeechProfile(
+        speech_s=int(loud.sum()) * frame_s,
+        mean_rms=float(voiced[loud].mean()),
+        longest_run_s=best * frame_s,
+    )
+
+
+def trim_trailing_silence(x: np.ndarray, native_rate: int, keep_ms: float = 100.0) -> np.ndarray:
+    """Drop a chunk's silent tail, keeping `keep_ms` of it as padding.
+
+    Every chunk ends with `hangover_ms` of silence, because that silence is what closed it --
+    ~29% of all audio handed to the model on the measured calls. Trimming it does *not* make
+    normal decodes faster (Whisper pads everything to a 30s window regardless); it makes
+    pathological ones rarer, because the silent tail is what degenerate repetition loops latch
+    onto. The measured looping clip went from 4132ms of "eight check check check..." untrimmed
+    to 1285ms of "8" trimmed, purely by not entering temperature fallback.
+
+    The hangover still does its real job upstream -- deciding the utterance has *ended*. This
+    only shortens the buffer handed to the model.
+
+    Returns `x` unchanged when nothing clears `SPEECH_FRAME_FLOOR`, so an all-quiet chunk is
+    never reduced to empty audio.
+    """
+    voiced, hop = _frame_rms(x, native_rate)
+    loud = np.flatnonzero(voiced > SPEECH_FRAME_FLOOR)
+    if not len(loud):
+        return x
+    keep = int(round(keep_ms / 1000 * native_rate))
+    end = min(len(x), int(loud[-1] + 1) * hop + keep)
+    return x[:end]
 
 
 class Segmenter:
@@ -190,10 +286,13 @@ def open_stream(
     """Build a configured (not yet started) InputStream. Use as a context manager.
 
     Finished chunks are pushed to `out_queue` as (audio: np.ndarray[float32] @ native_rate,
-    native_rate: int, closed_at: float, call_id: None) from the audio callback thread. The
-    trailing None is what the phone source uses to tag which call a chunk came from; the mic
-    has no such notion, but both sources share one queue shape so `consume_chunks` doesn't
-    have to care which one is feeding it.
+    native_rate: int, closed_at: float, call_id: None, final: bool) from the audio callback
+    thread. The trailing None is what the phone source uses to tag which call a chunk came
+    from; the mic has no such notion, but both sources share one queue shape so
+    `consume_chunks` doesn't have to care which one is feeding it.
+
+    `final` marks a chunk that hangup flushed, which the phone source uses to suppress the
+    click of a handset hitting its cradle. A mic stream just stops, so it is always False here.
     """
     import sounddevice as sd
 
@@ -211,7 +310,7 @@ def open_stream(
             print(f"[audio] {status}", file=sys.stderr)
         finished = segmenter.process(indata[:, 0])
         if finished is not None:
-            out_queue.put((finished, native_rate, time.perf_counter(), None))
+            out_queue.put((finished, native_rate, time.perf_counter(), None, False))
 
     stream = sd.InputStream(
         device=device,

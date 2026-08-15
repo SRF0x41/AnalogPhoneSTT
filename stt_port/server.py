@@ -21,7 +21,7 @@ One WebSocket connection per call, opened by the phone machine.
   |---|---|---|
   | phone -> here | `call_start` | `call_id`, `rate`, `direction` |
   | phone -> here | `call_end`   | `reason` |
-  | here -> phone | `transcript` | `call`, `text`, `dur_ms`, `latency_ms` |
+  | here -> phone | `transcript` | `call`, `text`, `dur_ms`, `latency_ms`, `continues_previous` |
   | here -> phone | `error`      | `message` |
 
 Binary in the here->phone direction is reserved for synthesized audio to play down the
@@ -237,10 +237,19 @@ class WebSocketSource:
 
     # --- tracking work in flight, so hangup can wait for it ----------------------------
 
-    def _queue_chunk(self, call_id: str, chunk) -> None:
+    def _queue_chunk(self, call_id: str, chunk, final: bool = False) -> None:
+        """Queue a closed utterance. `final` marks the one hangup flushed.
+
+        The worker needs that distinction and cannot derive it: every call measured ended with
+        the handset hitting its cradle, captured as a short loud chunk and transcribed as
+        `Thank you.`. It is louder and longer than the shortest genuine one-word answer, so no
+        acoustic rule separates them -- but it is the chunk hangup flushed, which is a fact only
+        this side knows. Carrying it on the tuple keeps `consume_chunks` source-agnostic; the
+        mic source sets it False and is otherwise unchanged.
+        """
         with self._pending_lock:
             self._pending[call_id] = self._pending.get(call_id, 0) + 1
-        self._queue.put((chunk, WIRE_RATE, time.perf_counter(), call_id))
+        self._queue.put((chunk, WIRE_RATE, time.perf_counter(), call_id, final))
 
     def _chunk_done(self, call_id: str | None) -> None:
         """One queued chunk has been transcribed. Runs on `consume_chunks`' thread."""
@@ -393,6 +402,8 @@ class WebSocketSource:
             if time.monotonic() - call.last_audio >= self._idle_timeout:
                 tail = call.segmenter.flush()
                 if tail is not None and not self._meter:
+                    # Not `final`: the call has stalled, not hung up. Whatever is in the buffer
+                    # is speech the caller is still in the middle of, not a cradle click.
                     self._queue_chunk(call.call_id, tail)
                 call.last_audio = time.monotonic()  # don't re-flush every tick
 
@@ -405,5 +416,5 @@ class WebSocketSource:
         self._meter_window = []
         tail = call.segmenter.flush()
         if tail is not None and not self._meter:
-            self._queue_chunk(call.call_id, tail)
+            self._queue_chunk(call.call_id, tail, final=True)
         print(f"[ws] call {call.call_id} ended ({reason}) {call.stats()}", file=sys.stderr)

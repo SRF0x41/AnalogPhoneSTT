@@ -140,6 +140,27 @@ threshold below the noise floor shows up as *latency*, not just as garbage lines
 Two symptoms, one cause. If transcripts are both cluttered and intermittently slow, this is
 the first thing to check, not the model or the network.
 
+> **Correction: on this line, the threshold was not the cause.** The paragraphs above blame
+> `--energy-threshold`, and five calls of measurement (`docs/ANALOG-TUNING.md`) showed that
+> diagnosis is wrong. The `0.01` default is **correctly calibrated here**: 14 seconds of
+> deliberate silence with the handset live produced *zero* chunks, and the quietest 100ms
+> window of every captured clip sits at 0.0016–0.0039 — a 5× margin under the threshold. Line
+> noise never opens an utterance. Running `--meter` on this line would change nothing.
+>
+> The hallucinations are real but come from somewhere else: **short chunks**, opened by a
+> breath, a mid-sentence pause, or the handset hitting its cradle at hangup. Lowering or
+> raising the threshold does not address any of those. They are handled instead by the two
+> gates in `consume_chunks` (`--min-speech-ms` / `--min-speech-rms`, plus a structural rule for
+> the hangup click), which suppress 10 of 10 filler utterances in the captured set.
+>
+> The 10.8s decodes were also not noise-length: the worst measured case was a **1.16s** clip
+> that sent Whisper into a repetition loop through its whole temperature-fallback ladder,
+> costing 22.4s. That is bounded now by a shortened ladder and `--inference-timeout`.
+>
+> Keep calibrating on a *new* line or a different ATA — the noise floor is a property of the
+> hardware, and the margin above is what you are checking for. Just don't reach for it to
+> explain filler on this one.
+
 `--meter` settles this in one call. It loads no model, transcribes nothing, and just prints
 rolling RMS to stderr:
 
@@ -340,6 +361,20 @@ covers how to tell, starting with `route -n get` on the phone machine's address.
 --benchmark FILE.WAV         run 20 inferences on a file, report p50/p95, exit
 --energy-threshold F         default: 0.02 (mic) / 0.01 (ws) -- calibrate with --meter
 --hangover-ms F              default: 500
+
+transcript quality (see docs/ANALOG-TUNING.md; calibrated on one HT801):
+--min-speech-ms F            drop a chunk holding less speech than this AND quieter than
+                             --min-speech-rms, before inference (default: 250; 0 disables)
+--min-speech-rms F           the energy half of that gate (default: 0.025; 0 disables).
+                             Measured over speech frames only, so anything at or below
+                             0.01 can never fire
+--min-speech-floor-ms F      drop a chunk whose longest *continuous* run of speech is
+                             shorter than this, at any volume (default: 130; 0 disables).
+                             A settling handset is loud but arrives as isolated taps
+--inference-timeout SECONDS  abandon a decode that runs longer than this (default: 4.0;
+                             0 disables)
+--numerals asis|digits       asis (default) keeps the model's rendering; digits converts
+                             spelled-out numbers up to 99 for a parsing consumer
 
 phone source (--source ws):
 --listen-host ADDR           default: 0.0.0.0

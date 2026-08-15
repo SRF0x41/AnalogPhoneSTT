@@ -95,10 +95,11 @@ to be applied by hand — they need root.
 
 ## Status
 
-Both halves are unit- and integration-tested offline: 51 tests covering the
-AudioSocket frame codec, the call lifecycle, the bridge, the WebSocket server, and
-segmentation at 8kHz — plus an end-to-end run of a synthetic Asterisk through both
-packages to a transcript arriving back on the phone machine.
+Both halves are unit- and integration-tested offline: 97 tests covering the
+AudioSocket frame codec, the call lifecycle, the bridge, the WebSocket server,
+segmentation at 8kHz, and the transcript-quality gates — plus an end-to-end run of a
+synthetic Asterisk through both packages to a transcript arriving back on the phone
+machine.
 
 **The first live call has now run** — real Asterisk, a real HT801, a real handset,
 across both machines. A 150-second call carried `blocks=7500 (150.0s)`: 7500 frames
@@ -107,19 +108,22 @@ transcribed accurately at a median 1.34s inference per utterance, transcripts
 arrived back on the phone machine, and the utterance interrupted by hanging up was
 still transcribed after `call_end` — the drain behaviour the design exists for.
 
-Two things that live hardware exposed, neither of them yet fixed:
+Two things that live hardware exposed:
 
-- **`--energy-threshold` is still uncalibrated**, and it matters more than the
-  offline tests could show: 12 of 32 utterances on that call were Whisper filler
-  (`so`, `Thank you.`) hallucinated onto segments that line noise had opened. See
-  [`stt_port/README.md`](stt_port/README.md).
+- **Transcript quality has since been measured across five calls and tuned.**
+  78 captured utterances showed the audio is not the problem (37.5 dB SNR, zero
+  frame loss) — the defects were decode-side. Filler hallucinations, runaway
+  decodes and formatting drift are now addressed; accuracy against a known
+  reference text scored 0% WER on three of four passages. The `--energy-threshold`
+  this README previously blamed turned out to be correctly calibrated. See
+  [`docs/ANALOG-TUNING.md`](docs/ANALOG-TUNING.md).
 - **The link is fragile in a way that logs nothing.** A wrong netmask on the stt
   machine silently misroutes the reply packets, and both machines then look
   healthy while no audio moves. See
   [`docs/LINK-TROUBLESHOOTING.md`](docs/LINK-TROUBLESHOOTING.md).
 
-Still unverified: transcription accuracy against a known reference text, and
-anything about call origination through ARI.
+Still unverified: anything about call origination through ARI, and there is still
+no way to send audio *back* down the line — the caller cannot hear a response.
 
 Machine-specific notes (device passwords, service paths) belong in an untracked
 `local-notes.md`, not in this repo.

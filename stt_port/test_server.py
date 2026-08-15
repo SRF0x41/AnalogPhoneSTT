@@ -15,23 +15,47 @@ import io
 import json
 import queue
 import threading
+import time
 import unittest
 
 import numpy as np
 
-from . import server
+from . import audio, main, server
 from .audio import HANGOVER_MS, Segmenter
+
+
+def wave_f32(samples: int, rate: int = server.WIRE_RATE, amplitude: float = 0.4) -> np.ndarray:
+    t = np.arange(samples, dtype=np.float32)
+    return np.sin(2 * np.pi * 300 * t / rate).astype(np.float32) * amplitude
 
 
 def tone(samples: int, amplitude: float = 0.4) -> bytes:
     """Loud PCM16 the segmenter will treat as speech."""
-    t = np.arange(samples, dtype=np.float32)
-    wave = np.sin(2 * np.pi * 300 * t / server.WIRE_RATE) * amplitude
-    return (wave * 32767).astype("<i2").tobytes()
+    return (wave_f32(samples, amplitude=amplitude) * 32767).astype("<i2").tobytes()
 
 
 def silence(samples: int) -> bytes:
     return b"\x00\x00" * samples
+
+
+def consumer_args(**overrides) -> argparse.Namespace:
+    """The args `consume_chunks` reads, defaulted the way the CLI defaults them.
+
+    Built from the same constants the parser uses, so a changed default is exercised here
+    rather than quietly diverging from what actually ships.
+    """
+    base = {
+        "debug_save_wav": False,
+        "verbose": False,
+        "jsonl": True,
+        "hangover_ms": HANGOVER_MS,
+        "min_speech_ms": main.DEFAULT_MIN_SPEECH_MS,
+        "min_speech_rms": main.DEFAULT_MIN_SPEECH_RMS,
+        "min_speech_floor_ms": main.DEFAULT_MIN_SPEECH_FLOOR_MS,
+        "inference_timeout": main.DEFAULT_INFERENCE_TIMEOUT,
+        "numerals": "asis",
+    }
+    return argparse.Namespace(**{**base, **overrides})
 
 
 class TestBlockAccumulator(unittest.TestCase):
@@ -223,10 +247,11 @@ class TestReceive(ServerTestCase):
         items = self.drain_queue()
 
         self.assertEqual(len(items), 1, "hangup should flush the open utterance")
-        chunk, rate, _closed_at, call_id = items[0]
+        chunk, rate, _closed_at, call_id, final = items[0]
         self.assertEqual(rate, server.WIRE_RATE)
         self.assertEqual(call_id, "abc123")
         self.assertGreater(len(chunk), 0)
+        self.assertTrue(final, "hangup flushed it, which is what the B2 gate keys on")
 
     async def test_audio_before_call_start_is_adopted(self):
         # The phone machine restarted mid-call, or a client didn't announce itself. The
@@ -340,7 +365,7 @@ class TestFinalTranscriptSurvivesHangup(unittest.IsolatedAsyncioTestCase):
             item = self.q.get()
             if item is None:
                 return
-            _chunk, _rate, _closed_at, call_id = item
+            _chunk, _rate, _closed_at, call_id, _final = item
             self.stop_consumer.wait(0.3)  # inference is never instant
             self.transcribed.append(call_id)
             self.source.emit(call_id, {"call": call_id, "text": f"utterance {len(self.transcribed)}"})
@@ -404,9 +429,14 @@ class TestIdleFlush(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(1.0)
 
                 self.assertFalse(q.empty(), "idle timeout should have flushed the utterance")
-                chunk, _rate, _t, call_id = q.get_nowait()
+                chunk, _rate, _t, call_id, final = q.get_nowait()
                 self.assertEqual(call_id, "stalled")
                 self.assertGreater(len(chunk), 0)
+                self.assertFalse(
+                    final,
+                    "a stalled call has not hung up: this is speech in progress, not a "
+                    "cradle click, and B2 must not treat it as one",
+                )
         finally:
             await source.stop()
 
@@ -422,11 +452,9 @@ class TestConsumeChunksSink(unittest.TestCase):
                 return "  transcribed text  "
 
         q: queue.Queue = queue.Queue()
-        q.put((np.zeros(16000, dtype=np.float32), 16000, 0.0, "call-1"))
+        q.put((wave_f32(16000, rate=16000), 16000, 0.0, "call-1", False))
         q.put(None)
-        args = argparse.Namespace(
-            debug_save_wav=False, verbose=False, jsonl=True, hangover_ms=HANGOVER_MS
-        )
+        args = consumer_args()
         seen = []
 
         consume_chunks(StubBackend(), q, args, sink=lambda cid, rec: seen.append((cid, rec)))
@@ -434,7 +462,8 @@ class TestConsumeChunksSink(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         call_id, record = seen[0]
         self.assertEqual(call_id, "call-1")
-        self.assertEqual(record["text"], "transcribed text")
+        # Stripped *and* normalised on the way through -- see TestNormaliseTranscript.
+        self.assertEqual(record["text"], "Transcribed text")
         self.assertEqual(record["call"], "call-1")
 
     def test_empty_transcript_is_signalled_to_the_sink_as_None(self):
@@ -451,11 +480,9 @@ class TestConsumeChunksSink(unittest.TestCase):
                 return "   "
 
         q: queue.Queue = queue.Queue()
-        q.put((np.zeros(16000, dtype=np.float32), 16000, 0.0, "call-2"))
+        q.put((wave_f32(16000, rate=16000), 16000, 0.0, "call-2", False))
         q.put(None)
-        args = argparse.Namespace(
-            debug_save_wav=False, verbose=False, jsonl=True, hangover_ms=HANGOVER_MS
-        )
+        args = consumer_args()
         seen = []
         printed = io.StringIO()
 
@@ -464,6 +491,384 @@ class TestConsumeChunksSink(unittest.TestCase):
 
         self.assertEqual(seen, [None], "the chunk is finished with, but there is no transcript")
         self.assertEqual(printed.getvalue(), "", "nothing empty should reach stdout")
+
+
+class TestSpeechProfile(unittest.TestCase):
+    """The metrics the filler gates are calibrated against (docs/ANALOG-TUNING.md, change B)."""
+
+    def test_loud_speech_measures_its_own_duration_and_level(self):
+        # A 1s sine at amplitude 0.4 has RMS 0.4/sqrt(2); every frame clears the floor.
+        p = audio.speech_profile(wave_f32(8000), 8000)
+
+        self.assertAlmostEqual(p.speech_s, 1.0, delta=0.03)
+        self.assertAlmostEqual(p.mean_rms, 0.4 / np.sqrt(2), delta=0.01)
+        self.assertAlmostEqual(p.longest_run_s, 1.0, delta=0.03)
+
+    def test_silence_measures_as_no_speech_at_all(self):
+        p = audio.speech_profile(np.zeros(8000, dtype=np.float32), 8000)
+
+        self.assertEqual(tuple(p), (0.0, 0.0, 0.0))
+
+    def test_only_frames_above_the_floor_are_counted(self):
+        # Half loud, half below the floor: the duration halves, the level does not sag.
+        x = np.concatenate([wave_f32(4000), wave_f32(4000, amplitude=0.001)])
+
+        p = audio.speech_profile(x, 8000)
+
+        self.assertAlmostEqual(p.speech_s, 0.5, delta=0.03)
+        self.assertAlmostEqual(p.mean_rms, 0.4 / np.sqrt(2), delta=0.01)
+
+    def test_scattered_taps_measure_a_short_run_despite_a_long_total(self):
+        """The handset-settling signature, and why total duration cannot see it.
+
+        Three isolated 60ms taps spread over 1.4s: 0.18s of speech in total, but nothing
+        continuous. A real word of the same total duration is one unbroken run.
+        """
+        tap = wave_f32(480)  # 60ms
+        gap = np.zeros(4000, dtype=np.float32)  # 500ms
+        x = np.concatenate([gap, tap, gap, tap, gap, tap])
+
+        p = audio.speech_profile(x, 8000)
+
+        self.assertAlmostEqual(p.speech_s, 0.18, delta=0.04)
+        self.assertLess(p.longest_run_s, 0.10)
+        self.assertGreater(p.mean_rms, 0.2, "and it is loud, so no energy gate reaches it")
+
+    def test_continuous_speech_runs_as_long_as_it_lasts(self):
+        p = audio.speech_profile(np.concatenate([np.zeros(800, dtype=np.float32), wave_f32(2400)]), 8000)
+
+        self.assertAlmostEqual(p.longest_run_s, p.speech_s, delta=0.03)
+
+    def test_mean_rms_can_never_land_between_zero_and_the_floor(self):
+        """The arithmetic that made the first version of the B1 gate inert.
+
+        The mean is taken over frames *already* above `SPEECH_FRAME_FLOOR`, so it is either
+        exactly 0.0 or strictly above the floor -- never in between. A gate threshold at or
+        below the floor therefore fires only on total silence, which is why B1 originally
+        suppressed nothing at all. Anything measuring speech at all must land above it.
+        """
+        for amplitude in (0.001, 0.005, 0.014, 0.02, 0.4):
+            p = audio.speech_profile(wave_f32(8000, amplitude=amplitude), 8000)
+
+            self.assertFalse(
+                0.0 < p.mean_rms <= audio.SPEECH_FRAME_FLOOR,
+                f"amplitude {amplitude} produced an impossible mean_rms of {p.mean_rms}",
+            )
+
+
+class TestTrimTrailingSilence(unittest.TestCase):
+    """Change C: shorten what the model sees, without touching what closed the utterance."""
+
+    def test_the_hangover_tail_is_removed_but_a_pad_is_kept(self):
+        chunk = np.concatenate([wave_f32(4000), np.zeros(4000, dtype=np.float32)])
+
+        trimmed = audio.trim_trailing_silence(chunk, 8000, keep_ms=100)
+
+        # 0.5s of speech, plus 100ms of the 0.5s tail, give or take a frame.
+        self.assertAlmostEqual(len(trimmed) / 8000, 0.6, delta=0.03)
+        self.assertLess(len(trimmed), len(chunk))
+
+    def test_speech_is_never_truncated(self):
+        chunk = np.concatenate([wave_f32(4000), np.zeros(4000, dtype=np.float32)])
+
+        trimmed = audio.trim_trailing_silence(chunk, 8000, keep_ms=0)
+
+        self.assertGreaterEqual(len(trimmed), 4000)
+
+    def test_an_all_quiet_chunk_is_returned_whole_not_emptied(self):
+        """Handing the model a zero-length array is worse than handing it silence."""
+        chunk = np.zeros(8000, dtype=np.float32)
+
+        self.assertEqual(len(audio.trim_trailing_silence(chunk, 8000)), 8000)
+
+    def test_a_chunk_with_no_tail_is_left_alone(self):
+        chunk = wave_f32(8000)
+
+        self.assertEqual(len(audio.trim_trailing_silence(chunk, 8000)), 8000)
+
+
+def profile(speech_s: float, mean_rms: float, run_s: float | None = None) -> audio.SpeechProfile:
+    """A measured chunk. `run_s` defaults to `speech_s` -- i.e. continuous speech."""
+    return audio.SpeechProfile(speech_s, mean_rms, speech_s if run_s is None else run_s)
+
+
+class TestFillerGates(unittest.TestCase):
+    """Change B, at the boundaries. Every number here comes from a measured clip."""
+
+    def setUp(self):
+        self.args = consumer_args()
+
+    def test_near_silence_is_dropped(self):
+        # The measured quiet filler: 0.02-0.16s of speech at 0.0102-0.0163 RMS.
+        self.assertIsNotNone(main.filler_reason(profile(0.02, 0.0102), False, self.args))
+        self.assertIsNotNone(main.filler_reason(profile(0.16, 0.0117), False, self.args))
+
+    def test_a_real_one_word_answer_is_kept(self):
+        # "Yes." 0.58s/0.084, "No." 0.36s/0.086, "Four." 0.36s/0.149 -- 8 of 8 measured
+        # replies sit clear of the gate on the duration axis, the energy axis, or both.
+        for speech_s, rms in [(0.58, 0.084), (0.36, 0.086), (0.36, 0.149), (0.38, 0.078)]:
+            self.assertIsNone(main.filler_reason(profile(speech_s, rms), False, self.args))
+
+    def test_short_but_loud_is_kept(self):
+        """The conjunction is the whole point: a duration-only gate ate a real word."""
+        self.assertIsNone(main.filler_reason(profile(0.24, 0.0823), False, self.args))
+
+    def test_long_but_quiet_is_kept(self):
+        self.assertIsNone(main.filler_reason(profile(1.20, 0.0150), False, self.args))
+
+    def test_either_threshold_at_zero_disables_the_conjunction(self):
+        """B1's two halves are an AND, so zeroing either one is an off switch for it.
+
+        The floor is a separate rule with its own off switch, hence zeroing it here too --
+        otherwise this only proves the floor is doing the work.
+        """
+        for off in (
+            consumer_args(min_speech_ms=0, min_speech_floor_ms=0),
+            consumer_args(min_speech_rms=0, min_speech_floor_ms=0),
+        ):
+            self.assertIsNone(main.filler_reason(profile(0.02, 0.0001), False, off))
+
+    def test_the_conjunction_still_catches_what_the_floor_does_not(self):
+        """0.16s of continuous speech clears the floor, but is quiet enough for B1."""
+        quiet_pause = profile(0.16, 0.0117)
+
+        self.assertIsNotNone(main.filler_reason(quiet_pause, False, self.args))
+        self.assertIsNone(main.filler_reason(quiet_pause, False, consumer_args(min_speech_ms=0)))
+
+    def test_the_hangup_click_is_dropped_however_loud_it_is(self):
+        """B2 is structural, not acoustic: the measured clicks peak at 0.98 and 0.15 RMS.
+
+        Louder than most genuine speech and longer than the shortest real utterance, so no
+        energy threshold reaches them -- only the fact that hangup is what flushed them.
+        """
+        self.assertIsNotNone(main.filler_reason(profile(0.20, 0.1524), True, self.args))
+        self.assertIsNotNone(main.filler_reason(profile(0.28, 0.1173), True, self.args))
+
+    def test_a_continuous_chunk_of_the_same_size_mid_call_is_kept(self):
+        self.assertIsNone(main.filler_reason(profile(0.20, 0.1524), False, self.args))
+
+    def test_a_caller_still_speaking_at_hangup_is_kept(self):
+        """Hanging up mid-sentence must not cost the sentence."""
+        self.assertIsNone(main.filler_reason(profile(1.80, 0.0900), True, self.args))
+
+    def test_a_loud_click_that_missed_b2_is_caught_by_the_continuity_floor(self):
+        """Regression, from two live calls: B2 alone is not enough.
+
+        Hang up a couple of seconds before the socket closes and the click closes on silence
+        like any other chunk, arriving with `final=False`. The first such click held 0.06s of
+        speech at 0.2372 RMS; the second held 0.20s at 0.1225 -- long enough to clear a
+        duration floor and far too loud for B1's energy half -- but in three isolated taps
+        whose longest run was 0.12s. Both were transcribed as `Thank you.`.
+        """
+        self.assertIsNotNone(main.filler_reason(profile(0.06, 0.2372), False, self.args))
+        self.assertIsNotNone(main.filler_reason(profile(0.20, 0.1225, run_s=0.12), False, self.args))
+
+    def test_the_floor_does_not_reach_any_real_utterance(self):
+        """Shortest real run measured: 0.14s in the corpus, 0.20s across the live calls."""
+        self.assertIsNone(main.filler_reason(profile(0.24, 0.0823, run_s=0.14), False, self.args))
+        self.assertIsNone(main.filler_reason(profile(0.20, 0.1791), False, self.args))
+
+    def test_the_floor_can_be_disabled(self):
+        off = consumer_args(min_speech_floor_ms=0, min_speech_ms=0)
+
+        self.assertIsNone(main.filler_reason(profile(0.06, 0.2372), False, off))
+
+
+class TestGatedChunksStillReachTheSink(unittest.TestCase):
+    """The hazard the gates had to be written around.
+
+    `WebSocketSource` holds a hung-up call's socket open until every queued chunk has come
+    back, and the only thing that reports one as finished is the sink. Since *every* call ends
+    with a chunk B2 drops, a gate that skipped the sink would stall every single hangup for
+    the full drain timeout. Green unit tests elsewhere would not show it -- only a real socket
+    waiting on the other end would.
+    """
+
+    def _run(self, item, **overrides):
+        calls = []
+
+        class CountingBackend:
+            def transcribe(self, audio):
+                calls.append(audio)
+                return "should not have been called"
+
+        q: queue.Queue = queue.Queue()
+        q.put(item)
+        q.put(None)
+        seen = []
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()) as err:
+            main.consume_chunks(
+                CountingBackend(), q, consumer_args(**overrides), sink=lambda cid, rec: seen.append(rec)
+            )
+        return calls, seen, printed.getvalue(), err.getvalue()
+
+    def test_a_gated_chunk_is_reported_finished_and_never_transcribed(self):
+        quiet = wave_f32(1600, rate=8000, amplitude=0.004)  # 0.2s, well under both thresholds
+
+        calls, seen, printed, _err = self._run((quiet, 8000, 0.0, "call-x", False))
+
+        self.assertEqual(calls, [], "the whole point is not paying for the decode")
+        self.assertEqual(seen, [None], "but the chunk must still count as finished")
+        self.assertEqual(printed, "")
+
+    def test_the_hangup_click_is_gated_and_reported(self):
+        click = wave_f32(1600, rate=8000, amplitude=0.4)  # 0.2s, loud -- only B2 catches it
+
+        calls, seen, _printed, _err = self._run((click, 8000, 0.0, "call-x", True))
+
+        self.assertEqual(calls, [])
+        self.assertEqual(seen, [None])
+
+    def test_every_suppression_is_logged_even_without_verbose(self):
+        """A vanished utterance must be distinguishable from a broken system."""
+        quiet = wave_f32(1600, rate=8000, amplitude=0.004)
+
+        _calls, _seen, _printed, err = self._run((quiet, 8000, 0.0, "call-x", False))
+
+        self.assertIn("[gate]", err)
+
+    def test_real_speech_is_not_gated(self):
+        speech = wave_f32(8000, rate=8000)
+
+        calls, seen, _printed, _err = self._run((speech, 8000, 0.0, "call-x", False))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0])
+
+
+class TestInferenceWatchdog(unittest.TestCase):
+    """Change A2. It cannot cancel a decode; it can stop the pipeline waiting on one."""
+
+    def test_a_runaway_decode_is_abandoned(self):
+        class StuckBackend:
+            def transcribe(self, audio):
+                time.sleep(5)
+                return "eight check check check"
+
+        watchdog = main.InferenceWatchdog(timeout_s=0.2)
+        try:
+            self.assertIsNone(watchdog.transcribe(StuckBackend(), np.zeros(16000, dtype=np.float32)))
+        finally:
+            watchdog.close()
+
+    def test_a_normal_decode_returns_its_text(self):
+        class FastBackend:
+            def transcribe(self, audio):
+                return "Yes."
+
+        watchdog = main.InferenceWatchdog(timeout_s=4.0)
+        try:
+            self.assertEqual(watchdog.transcribe(FastBackend(), np.zeros(16, dtype=np.float32)), "Yes.")
+        finally:
+            watchdog.close()
+
+    def test_a_zero_timeout_transcribes_inline_with_no_thread(self):
+        class FastBackend:
+            def transcribe(self, audio):
+                return "Yes."
+
+        watchdog = main.InferenceWatchdog(timeout_s=0)
+        try:
+            self.assertIsNone(watchdog._pool)
+            self.assertEqual(watchdog.transcribe(FastBackend(), np.zeros(16, dtype=np.float32)), "Yes.")
+        finally:
+            watchdog.close()
+
+    def test_an_abandoned_utterance_still_reports_the_chunk_as_finished(self):
+        """Same drain-path contract as a gated chunk: the socket must not hang on it."""
+
+        class StuckBackend:
+            def transcribe(self, audio):
+                time.sleep(5)
+                return "eight check check check"
+
+        q: queue.Queue = queue.Queue()
+        q.put((wave_f32(8000, rate=8000), 8000, 0.0, "call-y", False))
+        q.put(None)
+        seen = []
+        printed = io.StringIO()
+
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()) as err:
+            main.consume_chunks(
+                StuckBackend(),
+                q,
+                consumer_args(inference_timeout=0.2),
+                sink=lambda cid, rec: seen.append(rec),
+            )
+
+        self.assertEqual(seen, [None])
+        self.assertEqual(printed.getvalue(), "", "the garbage must not reach the transcript")
+        self.assertIn("[watchdog]", err.getvalue())
+
+
+class TestNormaliseTranscript(unittest.TestCase):
+    """Change D: consecutive utterances must agree about casing, numerals and punctuation.
+
+    Counting to twenty on a measured call produced `One.` `two.` `3` `four` `5,` `six`
+    `Seven.` -- the same class of token rendered five ways, because each utterance is an
+    independent decode with no memory of the last.
+    """
+
+    def test_casing_is_made_consistent(self):
+        self.assertEqual(main.normalise_transcript("two.")[0], "Two.")
+        self.assertEqual(main.normalise_transcript("Seven.")[0], "Seven.")
+
+    def test_trailing_commas_are_stripped(self):
+        self.assertEqual(main.normalise_transcript("5,")[0], "5")
+        self.assertEqual(main.normalise_transcript("  six ,  ")[0], "Six")
+
+    def test_a_comma_inside_the_sentence_is_left_alone(self):
+        text, _ = main.normalise_transcript("Please confirm invoice number 4729, dated August 15th.")
+
+        self.assertEqual(text, "Please confirm invoice number 4729, dated August 15th.")
+
+    def test_a_lowercase_opening_word_is_flagged_as_a_continuation(self):
+        """The model's own casing is the reassembly hint for a pause-split sentence."""
+        text, continues = main.normalise_transcript("and a shortfall.")
+
+        self.assertEqual(text, "And a shortfall.")
+        self.assertTrue(continues, "capitalising must not destroy the signal it overwrites")
+
+    def test_a_sentence_start_is_not_flagged(self):
+        self.assertFalse(main.normalise_transcript("The branch reported a surplus.")[1])
+
+    def test_a_leading_digit_carries_no_casing_signal(self):
+        self.assertFalse(main.normalise_transcript("400 units.")[1])
+
+    def test_numerals_are_left_alone_by_default(self):
+        self.assertEqual(main.normalise_transcript("but thirty five boxes")[0], "But thirty five boxes")
+
+    def test_numerals_can_be_converted_for_a_parsing_consumer(self):
+        for spoken, expected in [
+            ("but thirty five boxes", "But 35 boxes"),
+            ("thirty-five", "35"),
+            ("four hundred units", "400 units"),
+            ("one.", "1."),
+            ("fifteen", "15"),
+        ]:
+            self.assertEqual(main.normalise_transcript(spoken, "digits")[0], expected)
+
+    def test_conversion_does_not_touch_numbers_already_in_digits(self):
+        text, _ = main.normalise_transcript("Verify whether it was 50 or 15.", "digits")
+
+        self.assertEqual(text, "Verify whether it was 50 or 15.")
+
+    def test_an_empty_transcript_stays_empty(self):
+        self.assertEqual(main.normalise_transcript("   "), ("", False))
+
+    def test_the_record_carries_the_normalised_text_and_the_hint(self):
+        record = main.emit_transcript(
+            "and a shortfall,",
+            np.zeros(16000, dtype=np.float32),
+            time.perf_counter(),
+            "call-1",
+            consumer_args(),
+        )
+
+        self.assertEqual(record["text"], "And a shortfall")
+        self.assertTrue(record["continues_previous"])
 
 
 if __name__ == "__main__":
