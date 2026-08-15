@@ -20,7 +20,7 @@ pretty = no
 [analogphone]
 type = user
 read_only = no
-; Change this, and put the same value in ANALOGPHONE_ARI_PASSWORD (see phone/config.py).
+; Change this, and put the same value in ARI_PASSWORD in phone/config.py.
 ; It is a plaintext password in a config file: keep bindaddr on 127.0.0.1 above.
 password = CHANGE_ME
 password_format = plain

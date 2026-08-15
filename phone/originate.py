@@ -51,7 +51,7 @@ def _post_channel(endpoint: str, context: str, extension: str, timeout: float) -
     if response.status_code == 401:
         raise OriginateError(
             f"ARI rejected the credentials for user {config.ARI_USER!r}. "
-            "Set ANALOGPHONE_ARI_USER / ANALOGPHONE_ARI_PASSWORD to match ari.conf."
+            "Set ARI_USER / ARI_PASSWORD in phone/config.py to match ari.conf."
         )
     if response.status_code >= 400:
         raise OriginateError(
