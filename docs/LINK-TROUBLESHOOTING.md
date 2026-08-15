@@ -113,8 +113,23 @@ Write the mask into the network service configuration, with an **empty router**:
 sudo networksetup -setmanual "USB3.0 Displaylink" 192.168.50.120 255.255.255.0 ""
 ```
 
-Verify with `networksetup -getinfo "USB3.0 Displaylink"` — it should now report a
-subnet mask of `255.255.255.0` and no router, rather than "Manually Using DHCP Router".
+**Verified working on 2026-08-15.** `networksetup -getinfo "USB3.0 Displaylink"` afterwards
+reports exactly this, and the default route stays on Wi-Fi:
+
+```
+Manual Configuration
+IP address: 192.168.50.120
+Subnet mask: 255.255.255.0
+Router: (null)
+```
+
+The empty-string router argument is accepted rather than rejected, which is the part worth
+confirming — `Router: (null)` is the desired outcome, not a sign the command half-failed.
+
+This failure recurred once before the permanent fix was applied: the `ifconfig` command was
+run, the link worked for three calls, and the adapter then reverted to `/32` between
+sessions. The symptom on its return was indistinguishable from a fresh bug — the stt server
+was running and listening the whole time. **Apply the permanent fix the first time.**
 
 **The empty router is the important part, and is not an oversight.** Check the service
 order first:

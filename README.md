@@ -63,6 +63,10 @@ protocol between two pyVoIP/Asterisk processes. It explains what that had to sol
 and why the current design doesn't have to solve it. Its reasoning about packet
 loss and silence detection still applies.
 
+[`docs/ANALOG-TUNING.md`](docs/ANALOG-TUNING.md) is a measured plan for improving
+transcript quality on a real analog line — what the line's audio actually looks
+like, which defects are worth fixing, and which intuitive fixes are dead ends.
+
 [`docs/LINK-TROUBLESHOOTING.md`](docs/LINK-TROUBLESHOOTING.md) covers failures of
 the network path between the two machines — in particular the one where a wrong
 netmask on the stt machine makes the stt layer look dead while neither side logs
